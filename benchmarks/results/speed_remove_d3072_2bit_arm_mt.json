@@ -1,0 +1,10 @@
+{
+  "dim": 3072,
+  "bit_width": 2,
+  "arch": "arm",
+  "threading": "mt",
+  "tq_remove_1_us": 2.381,
+  "tq_remove_100_us": 264.4,
+  "faiss_remove_1_us": 377115.0,
+  "faiss_remove_100_us": 42345494.2
+}

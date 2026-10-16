@@ -1,0 +1,10 @@
+{
+  "dim": 1536,
+  "bit_width": 4,
+  "arch": "x86",
+  "threading": "mt",
+  "tq_single_add_us": 8.17,
+  "tq_batch100_add_us": 383.48,
+  "faiss_single_add_us": 91.0,
+  "faiss_batch100_add_us": 908.26
+}
