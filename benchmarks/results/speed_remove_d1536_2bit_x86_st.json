@@ -1,0 +1,10 @@
+{
+  "dim": 1536,
+  "bit_width": 2,
+  "arch": "x86",
+  "threading": "st",
+  "tq_remove_1_us": 3.105,
+  "tq_remove_100_us": 340.7,
+  "faiss_remove_1_us": 257807.7,
+  "faiss_remove_100_us": 28938967.8
+}

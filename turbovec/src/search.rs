@@ -11,17 +11,397 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
+
+/// Block-count threshold above which a single unmasked query scans in
+/// parallel. Bindings use [`single_query_parallelizes`] (which wraps
+/// this) to decide when an nq=1 search must run inside the fork-safe
+/// pool instead of inline.
+///
+/// Set to one full `MIN_TILE_BLOCKS`-sized tile: below that the batch
+/// dispatch would not split the block axis either, so a single query
+/// gains nothing from the pool and pays the `install` handoff plus a slot
+/// in the process-wide pool queue (#336). The previous 256 fired at
+/// n = 8192, where the handoff alone was larger than the whole scan.
+/// Measured A/B interleaved (14-core arm64, dim=128, k=10, nq=1, inline
+/// vs pooled, min-of-7 rounds): 0.64x at n=8192, 0.77x at 16384, 0.98x at
+/// 32768, 1.34x at 65536 — inline is faster up to ~32k and the crossover
+/// sits at 1024 blocks. At `RAYON_NUM_THREADS=1` inline is never slower
+/// at any size.
+pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 1024;
+
+/// Whether an nq=1 search over `n_vectors` is *large enough* to take the
+/// block-parallel path.
+///
+/// This is the size half of the gate, and it is the whole gate on
+/// aarch64. It is a **necessary but not sufficient** condition, not a
+/// prediction: what it guarantees is the safe direction of the #147
+/// invariant —
+///
+/// > `false` ⇒ the core never splits the block axis for that query, on
+/// > every target.
+///
+/// The Python bindings consult it to decide whether an nq=1 search must
+/// run inside the fork-safe rayon pool. Only the `false` direction has to
+/// hold for that to be sound: routing a query into the pool that then
+/// runs serially wastes an `install` handoff, whereas splitting outside
+/// the pool would be a correctness bug.
+///
+/// `true` can still run serially, because each dispatch adds its own
+/// terms after the size test:
+///
+/// * **both targets**, under a mask: the single-query kernel splits over
+///   the blocks the mask leaves allowed, not the index's, and runs in one
+///   range when those are fewer than the gate (#554). The predicate for
+///   a masked search is [`single_query_parallelizes_masked`]; this one
+///   is its unmasked case.
+/// * **aarch64** adds nothing else — `nq == 1 && n_blocks >=
+///   SINGLE_QUERY_PARALLEL_MIN_BLOCKS` is exactly the branch condition,
+///   so for an unmasked query the predicate is exact.
+/// * **x86_64** additionally requires runtime AVX2+FMA (or AVX-512BW +
+///   AVX-512F + FMA). On a CPU without them the dedicated single-query
+///   kernel is skipped and the batch dispatch is handed
+///   `serial_required(.., simd_ok = false, ..) == true`, which pins
+///   the block-range count at 1 — a fully serial scan at a size this
+///   predicate calls parallel. That is the exact hardware
+///   `score_query_into_heap` exists for.
+///
+/// Both halves are pinned by tests rather than by inspection:
+/// `above_gate_single_query_does_split` and
+/// `sub_gate_single_query_never_splits_the_block_axis` cover the size
+/// term, and `each_term_of_the_serial_predicate_forces_serial_alone`
+/// covers the x86 `simd_ok` term.
+///
+/// Neither dispatch calls this function directly: each re-tests
+/// `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` inline at its own branch, and
+/// nothing makes those inline conditions agree with this function.
+/// It is still reached on an nq=1 search, indirectly — when the inline
+/// test sends a single query down the batch path, that path's
+/// `n_block_ranges` tests `nq == 1 && !single_query_parallelizes(..)`
+/// and clamps the block-range count to 1.
+///
+/// That clamp is a drift guard rather than a live safety mechanism.
+/// While `SINGLE_QUERY_PARALLEL_MIN_BLOCKS == MIN_TILE_BLOCKS` (both
+/// 1024) it is inert: a query it would clamp has fewer than
+/// `MIN_TILE_BLOCKS` blocks, so the `n_blocks.div_ceil(min_tile_blocks)`
+/// term already pins the count at 1 on its own. It only starts doing
+/// work of its own if the two constants diverge — which is what makes
+/// the threshold safe to move.
+pub fn single_query_parallelizes(n_vectors: usize) -> bool {
+    n_vectors.div_ceil(crate::BLOCK) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+}
+
+/// [`single_query_parallelizes`] for a masked search (#554).
+///
+/// The size gate above counts the index's blocks; a mask decides how many
+/// of them the scan visits, since a block with no allowed vector is
+/// skipped before it is read. A selective mask therefore leaves a scan
+/// that is cheap to run serially, and the pool handoff — which grows with
+/// the thread count — would cost more than the work it spreads. This
+/// predicate counts the blocks the mask leaves with at least one allowed
+/// vector and applies the same threshold to them, so a dense mask (a
+/// tenant, a soft-delete set) keeps the parallel scan and a selective one
+/// stays serial whatever the index size.
+///
+/// The same direction of the #147 invariant holds: `false` ⇒ the core
+/// never splits the block axis for that query. The core's split tests
+/// [`allowed_blocks`] over its packed form of the same mask, and
+/// `the_masked_pool_predicate_agrees_with_the_core` pins the two to the
+/// same count.
+pub fn single_query_parallelizes_masked(n_vectors: usize, mask: Option<&[bool]>) -> bool {
+    let allowed = match mask {
+        None => n_vectors.div_ceil(crate::BLOCK),
+        Some(m) => m.chunks(crate::BLOCK).filter(|c| c.iter().any(|&b| b)).count(),
+    };
+    allowed >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+}
+
+/// Blocks a packed mask leaves with at least one allowed vector; every
+/// block when there is no mask. A mask word covers two 32-vector blocks,
+/// so each half-word is tested once — one pass over the words, not the
+/// bits. Bits past `n_vectors` are never set, so the count is clamped to
+/// `n_blocks` only against a mask longer than the index.
+pub(crate) fn allowed_blocks(mask: Option<&[u64]>, n_blocks: usize) -> usize {
+    match mask {
+        None => n_blocks,
+        Some(m) => m
+            .iter()
+            .map(|&w| ((w & 0xFFFF_FFFF) != 0) as usize + ((w >> 32) != 0) as usize)
+            .sum::<usize>()
+            .min(n_blocks),
+    }
+}
+
+/// Workers a single query's scan is split over: the pool's count when the
+/// mask leaves at least the gate's worth of blocks to visit, else one, so
+/// the scan runs on the calling thread with no handoff (#554).
+fn single_query_workers(mask: Option<&[u64]>, n_blocks: usize) -> usize {
+    if allowed_blocks(mask, n_blocks) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
+        rayon::current_num_threads().max(1)
+    } else {
+        1
+    }
+}
+
+/// Smallest block-axis tile the batch dispatch will create. Below one
+/// full tile the block axis is not split at all, so this is also the
+/// floor for [`SINGLE_QUERY_PARALLEL_MIN_BLOCKS`] — a single query must
+/// not be routed into the pool at a size where the same work, batched,
+/// would not have been worth splitting (#336).
+///
+/// Hoisted from the two per-architecture dispatch bodies so the two
+/// constants can be related in one place instead of drifting apart.
+pub(crate) const MIN_TILE_BLOCKS: usize = 1024;
+
+
+/// Whether the block axis must not be split at all, whatever the size.
+///
+/// Any one of these forces it: a mask (the allowlist walk is sequential),
+/// no usable SIMD, or a caller-forced scalar path. Extracted from the
+/// dispatch call site so the rule is unit-testable — inline it was a
+/// three-term expression whose individual terms no test could reach, so
+/// an `||` there could become `&&` unnoticed.
+///
+/// x86-only, because only the x86 dispatch derives `serial` from these
+/// three terms — the aarch64 path passes a literal `false`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn serial_required(mask_present: bool, simd_ok: bool, force_scalar_any: bool) -> bool {
+    mask_present || !simd_ok || force_scalar_any
+}
+
+/// Number of block-axis ranges the batch dispatch splits into.
+///
+/// Extracted so the gate is testable without timing and so both the
+/// aarch64 and x86 dispatches share one rule. The `nq == 1` clamp is the
+/// #147 invariant: [`single_query_parallelizes`] is what the Python
+/// bindings consult to decide whether a search must run inside the
+/// fork-safe pool, so a single query it calls *serial* must not reach
+/// rayon here either.
+
+/// Queries per batch for the 2-bit VNNI kernel (H56). See the `nq_batch`
+/// selection in the x86 dispatch for the measurement.
+#[cfg(target_arch = "x86_64")]
+const VNNI_BATCH: usize = 6;
+
+#[inline]
+fn n_block_ranges(
+    nq: usize,
+    n_quads: usize,
+    n_blocks: usize,
+    n_vectors: usize,
+    k: usize,
+    n_threads: usize,
+    tiles_per_thread: usize,
+    min_tile_blocks: usize,
+    serial: bool,
+) -> usize {
+    if n_threads == 1 || serial || (nq == 1 && !single_query_parallelizes(n_vectors)) {
+        return 1;
+    }
+    (n_threads * tiles_per_thread)
+        .div_ceil(n_quads)
+        .min(n_blocks.div_ceil(min_tile_blocks))
+        .min(range_cap_for_k(n_vectors, k))
+        .max(1)
+}
+
+/// How many tiles per worker the block-axis split aims to produce.
+///
+/// The tiles are the unit rayon load-balances over, and they are not
+/// equal-cost, so the schedule is only as good as its granularity: with
+/// too few, the final wave leaves most workers idle while the stragglers
+/// finish. At nq=100 on 8 workers the old target of 4 gave 25 quads x 2
+/// ranges = 50 tiles, i.e. 6.25 waves rounded up to 7 — an entire ragged
+/// wave of waste. Raising the target lets the split run to the
+/// `min_tile_blocks` cap (7 ranges, 175 tiles) where the tail is
+/// amortized instead.
+///
+/// Swept interleaved at (200k, 768, 4-bit, nq=100, k=10), 5 rounds of
+/// reps=15, medians, target = 4 / 16 / 32:
+///
+/// * arm (c4a-standard-8): 41.43 / 37.64 / **37.50** ms — x1.105
+/// * x86 (c3-standard-8):  61.85 / 60.27 / **60.04** ms — x1.030
+///
+/// 32 beat 16 on both and the x86 samples do not overlap (60.02–60.06 vs
+/// 60.23–60.29). Shapes where the other caps bind are unchanged: below
+/// nq≈21 (at the benched 200k shape) the `min_tile_blocks` cap decided
+/// the count under the old target too, and the count still falls to 1
+/// once `n_quads` alone exceeds the target. Between nq≈21 and 64 the
+/// count CAN rise to the block cap (e.g. nq=24: 6 → 7 ranges) — results
+/// there are covered by the bitwise sweep below (nq=25 is in it), and
+/// the cost delta is one more range's heap, bounded by the same cap
+/// that binds at nq=100.
+///
+/// Results are unaffected — the cross-range merge is
+/// (score desc, index asc) by construction, so the range count cannot
+/// change what a search returns. Verified bitwise on both arches across
+/// nq ∈ {1,4,25,100,257} x k ∈ {1,10,100} plus masked and tied-score
+/// shapes (40 result arrays, identical at every count swept).
+const TILES_PER_THREAD: usize = 32;
+
+/// The same two knobs for the NEON dispatch, which wants a markedly finer
+/// split than x86.
+///
+/// The difference is the per-range top-k, not the scan: splitting the block
+/// axis gives every range its own `k`-entry heap, and the AVX-512 dispatch
+/// pays more for that duplication than the finer schedule returns. Swept
+/// block-major at (200k, 768, 4-bit, nq=100, k=10), medians against the
+/// 7-range default:
+///
+/// | ranges | search-arm | search-x86 |
+/// |---|---|---|
+/// | 7 | 36.738 | **59.789** |
+/// | 21 | **36.125** | 60.635 |
+/// | 41 | 37.391 | 62.655 |
+///
+/// arm peaks at 21 ranges where x86 is already losing and keeps losing.
+/// One shared constant cannot hold both, and the two dispatches are
+/// separate `cfg` bodies with separate kernels anyway, so each carries its
+/// own pair. Confirmed by an 8-round interleaved A/B: arm x1.0170
+/// (36.738 -> 36.125, every candidate sample below every control sample),
+/// x86 untouched by construction. See LOG_search.md H15.
+#[cfg(target_arch = "aarch64")]
+const TILES_PER_THREAD_NEON: usize = TILES_PER_THREAD * 2;
+
+/// See [`TILES_PER_THREAD_NEON`]. Lower than [`MIN_TILE_BLOCKS`] so the
+/// finer target can be reached; the
+/// `SINGLE_QUERY_PARALLEL_MIN_BLOCKS >= MIN_TILE_BLOCKS` invariant relates
+/// the single-query gate to the shared floor and is unaffected.
+#[cfg(target_arch = "aarch64")]
+const MIN_TILE_BLOCKS_NEON: usize = MIN_TILE_BLOCKS / 2;
+
+/// The x86 dispatch's own block floor, 3x the shared one.
+///
+/// `MIN_TILE_BLOCKS` cannot simply move: it is also the single-query pool
+/// gate (`SINGLE_QUERY_PARALLEL_MIN_BLOCKS >= MIN_TILE_BLOCKS`) and the base
+/// for the NEON floor, so raising it would break the invariant and undo H69.
+/// x86 gets its own constant, exactly as aarch64 already does.
+///
+/// 3072 gives 3 block ranges at N=200k where 1024 gave 7. Swept after
+/// H54/H59/H62/H65 changed x86's memory behaviour — H37 had found 7 optimal
+/// against the pre-H34 kernel. nq=100 MT medians: 18.755 / 18.711 / **18.004**
+/// / 18.902 ms for 1024 / 2048 / 3072 / 4096, a x1.042 win with no overlap,
+/// and 4096 turning back up marks it as a knee rather than a trend. Same
+/// direction as H69 on arm: a faster, streaming kernel wants fewer and
+/// longer contiguous runs. See H70.
+#[cfg(target_arch = "x86_64")]
+const MIN_TILE_BLOCKS_X86: usize = MIN_TILE_BLOCKS * 3;
+// Was `/ 4` (256 blocks, 24 ranges at N=200k), tuned in H15 against a
+// kernel that has since gained SMMLA (H33), the vm8 layout (H41), the H45
+// restructure and prefetch (H67). `/ 2` gives 12 ranges and is worth x1.048
+// on nq=100 MT, winning all five interleaved rounds without overlap. Fewer,
+// larger ranges suit a kernel that now streams: each worker keeps a longer
+// contiguous run, and the per-range top-k duplication that argued for a
+// finer split costs the same as it always did while the scan got 2.5x
+// cheaper. See H69.
+
+/// Rescan a full top-k heap for its minimum. Ties on score resolve to
+/// the LARGEST index — the eviction victim among tied minima — so that
+/// sequential scans keep the lowest-index members of any tied cohort,
+/// matching the block-parallel paths' index-ascending merges. This is
+/// what makes top-k results identical across the batch, scalar, and
+/// parallel single-query paths even for bitwise-tied scores (duplicate
+/// vectors).
+/// H99 marker in a heap's min-index slot: the arrays are a buffered
+/// collector, not a top-k heap. Lanes above the threshold are appended; at
+/// capacity `k` the best `k / 2` are kept and the threshold rises to the
+/// worst of them. A collector therefore always holds its range's top `k / 2`.
+pub(crate) const HEAP_BUFFERED: usize = usize::MAX;
+
+/// H99: reduce a buffered scan's merged candidates to the best `k / 2`,
+/// unordered. Linear time, where the heaps' merge is a full sort: the
+/// shortlist is rescored, so its order is never read.
+fn buffered_select(pairs: &mut Vec<(f32, u64)>, k: usize) {
+    let keep = (k / 2).max(1);
+    if pairs.len() > keep {
+        pairs.select_nth_unstable_by(keep - 1, |a, b| {
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1))
+        });
+        pairs.truncate(keep);
+    }
+}
+
+/// Keep the best half of a full collector; returns the new threshold.
+#[inline(never)]
+fn compact_half(hs: &mut [f32], hi: &mut [u64], k: usize) -> f32 {
+    let keep = (k / 2).max(1);
+    let mut pairs: Vec<(f32, u64)> =
+        hs[..k].iter().copied().zip(hi[..k].iter().copied()).collect();
+    pairs.select_nth_unstable_by(keep - 1, |a, b| {
+        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1))
+    });
+    for (j, p) in pairs[..keep].iter().enumerate() {
+        hs[j] = p.0;
+        hi[j] = p.1;
+    }
+    pairs[keep - 1].0
+}
+
+#[inline(always)]
+fn rescan_min(hs: &[f32], hi: &[u64], k: usize) -> (f32, usize) {
+    let mut mi = 0usize;
+    for h in 1..k {
+        if hs[h] < hs[mi] || (hs[h] == hs[mi] && hi[h] > hi[mi]) {
+            mi = h;
+        }
+    }
+    (hs[mi], mi)
+}
+/// Upper bound on block-range tiles for a given `k`.
+///
+/// Splitting the block axis duplicates the per-query top-k: each range
+/// keeps its own `k`-entry heap (every replacement an O(k)
+/// [`rescan_min`]) and the cross-range merge then sorts `n_ranges * k`
+/// candidates. That cost grows with `k`, while the load-balancing
+/// benefit of tiling does not — so past some point splitting is a net
+/// loss. Bound the split by how many vectors each range would still
+/// hold per unit of `k`. At the batch default (k=10, 200k vectors) this
+/// never binds; at k=1000 it collapses to a single range, i.e. exactly
+/// the untiled behavior.
+#[inline]
+fn range_cap_for_k(n_vectors: usize, k: usize) -> usize {
+    // Swept on a c4a-standard-8 (200k x 768, 4-bit) over
+    // k ∈ {10, 100, 200, 400, 1000} × nq ∈ {20, 100}: 256 left k=400 at
+    // 1.2-1.5x, 1024 gave back the k=100 win; 512 holds every cell at or
+    // below parity while preserving the k=10 win (0.69x / 0.84x).
+    const MIN_VECTORS_PER_RANGE_PER_K: usize = 512;
+    n_vectors
+        .div_ceil(MIN_VECTORS_PER_RANGE_PER_K * k.max(1))
+        .max(1)
+}
+
+/// Avoid the ragged schedule where the tile count lands just above the
+/// worker count — one full round plus a long tail on mostly-idle
+/// workers. When the caps push us into that zone, prefer a single round
+/// instead: the duplicated per-range top-k is exactly the cost the `k`
+/// cap exists to avoid, so paying it *and* getting a bad schedule is the
+/// worst of both. (Measured: at nq=20 on 8 workers this is the whole
+/// difference between 1.2x and 0.96x at k=400.)
+#[inline]
+fn smooth_tile_count(n_ranges: usize, n_quads: usize, n_threads: usize) -> usize {
+    let tiles = n_quads * n_ranges;
+    if tiles > n_threads && tiles < 2 * n_threads {
+        (n_threads / n_quads).max(1)
+    } else {
+        n_ranges
+    }
+}
+
+use crate::rotation::Rotation;
 use crate::{BLOCK, FLUSH_EVERY};
 
 /// Cumulative count of 32-vector blocks short-circuited by the mask
-/// early-exit path. Incremented atomically by [`block_has_allowed`]
-/// and [`block_pair_has_allowed`] whenever a block (or pair) is skipped
-/// because no allowed slots fall within it.
+/// early-exit path, incremented by [`block_has_allowed`] and
+/// [`block_pair_has_allowed`] — but **only** under the
+/// `mask-skip-counter` feature. The per-skip atomic RMW landed on one
+/// shared cache line in the masked hot loop, so counting every skip made
+/// a more selective filter cost more (#294).
 ///
-/// Process-global. Tests sample before/after a single search to verify
-/// the skip path fires; production callers can read it for hybrid-
-/// retrieval telemetry. Reset is provided for test isolation.
-pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
+/// Deliberately not public: when counting is compiled out this reads
+/// zero, which is indistinguishable from "nothing was skipped". Read it
+/// through [`blocks_skipped_by_mask`], whose `Option` makes that
+/// difference impossible to miss.
+pub(crate) static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// Test-only switch that forces the x86 dispatch to take the scalar
 /// fallback even when AVX2/AVX-512 is available, so tests can exercise
@@ -32,9 +412,31 @@ pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FORCE_SCALAR_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Current value of the block-skip counter. See [`BLOCKS_SKIPPED_BY_MASK`].
-pub fn blocks_skipped_by_mask() -> u64 {
-    BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed)
+/// Held for writing by the test that sets [`FORCE_SCALAR_FALLBACK`], and
+/// for reading by tests that compare two searches' scores bit for bit:
+/// the scalar path ranks the same but rounds differently, so a flip
+/// between the two searches fails such a comparison.
+#[cfg(test)]
+pub(crate) static SCALAR_FALLBACK_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Blocks short-circuited by the mask early-exit path since the last
+/// [`reset_blocks_skipped_by_mask`], or `None` when the crate was built
+/// without the `mask-skip-counter` feature.
+///
+/// The `Option` is the point: counting costs an atomic RMW per skipped
+/// block on a shared cache line, so it is off by default (#294). Handing
+/// a telemetry consumer a plain `0` in that case would be a silent lie —
+/// "no blocks were skipped" and "this build does not count" are different
+/// facts and must not share a representation (#368).
+pub fn blocks_skipped_by_mask() -> Option<u64> {
+    #[cfg(feature = "mask-skip-counter")]
+    {
+        Some(BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "mask-skip-counter"))]
+    {
+        None
+    }
 }
 
 /// Reset the block-skip counter. Tests call this before issuing a
@@ -43,8 +445,165 @@ pub fn reset_blocks_skipped_by_mask() {
     BLOCKS_SKIPPED_BY_MASK.store(0, Ordering::Relaxed);
 }
 
+/// H72: the single-query LUT scan over 2-bit codes in the `vm8` layout.
+///
+/// Same arithmetic as [`score_4bit_block_neon`] — the u8 tables, the u8
+/// pre-add, the u16 accumulators and the flush — so scores are bit-identical
+/// to the sequential-layout kernel on the same index. What differs is the
+/// load: a `vm8` octet holds 32 vectors x 8 byte-groups with each vector's
+/// eight bytes adjacent, so the eight group registers the LUT step wants
+/// come from a three-level `UZP` tree over eight 16-byte loads (per 16
+/// vectors), 24 permutes per 128 B. That is the price of the layout at nq=1;
+/// H72's probe measures it.
 #[cfg(target_arch = "aarch64")]
-unsafe fn score_4bit_block_neon(
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn score_2bit_block_vm8_neon(
+    blocked_codes: &[u8],
+    uint8_luts: &[u8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    scale: f32,
+    bias: f32,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [f32; BLOCK],
+) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(n_byte_groups % 8, 0);
+
+    let mask = vdupq_n_u8(0x0F);
+    let v_scale = vdupq_n_f32(scale);
+    let mut fa = [vdupq_n_f32(bias); 8];
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+    let luts_base = uint8_luts.as_ptr();
+    let octs = n_byte_groups / 8;
+    let mut accum = [vdupq_n_u16(0); 4];
+
+    #[inline(always)]
+    unsafe fn groups_of(p: *const u8) -> [uint8x16_t; 8] {
+        let r: [uint8x16_t; 8] = std::array::from_fn(|i| vld1q_u8(p.add(i * 16)));
+        let t = [
+            vuzp1q_u8(r[0], r[1]), vuzp1q_u8(r[2], r[3]), vuzp1q_u8(r[4], r[5]), vuzp1q_u8(r[6], r[7]),
+            vuzp2q_u8(r[0], r[1]), vuzp2q_u8(r[2], r[3]), vuzp2q_u8(r[4], r[5]), vuzp2q_u8(r[6], r[7]),
+        ];
+        let u = [
+            vuzp1q_u8(t[0], t[1]), vuzp1q_u8(t[2], t[3]), vuzp2q_u8(t[0], t[1]), vuzp2q_u8(t[2], t[3]),
+            vuzp1q_u8(t[4], t[5]), vuzp1q_u8(t[6], t[7]), vuzp2q_u8(t[4], t[5]), vuzp2q_u8(t[6], t[7]),
+        ];
+        [
+            vuzp1q_u8(u[0], u[1]), vuzp1q_u8(u[4], u[5]), vuzp1q_u8(u[2], u[3]), vuzp1q_u8(u[6], u[7]),
+            vuzp2q_u8(u[0], u[1]), vuzp2q_u8(u[4], u[5]), vuzp2q_u8(u[2], u[3]), vuzp2q_u8(u[6], u[7]),
+        ]
+    }
+
+    for o in 0..octs {
+        let ga = groups_of(codes_base.add(o * 256));
+        let gb = groups_of(codes_base.add(o * 256 + 128));
+        for j in 0..8 {
+            let lp = luts_base.add((8 * o + j) * 32);
+            let lut_hi = vld1q_u8(lp);
+            let lut_lo = vld1q_u8(lp.add(16));
+            let (c0, c1) = (ga[j], gb[j]);
+            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c0, 4)));
+            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c1, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c1, 4)));
+            accum[0] = vaddw_u8(accum[0], vget_low_u8(s0));
+            accum[1] = vaddw_u8(accum[1], vget_high_u8(s0));
+            accum[2] = vaddw_u8(accum[2], vget_low_u8(s1));
+            accum[3] = vaddw_u8(accum[3], vget_high_u8(s1));
+        }
+        // Flush at the same cadence as the sequential kernel (one batch of
+        // FLUSH_EVERY groups); octets never straddle a batch boundary since
+        // FLUSH_EVERY is a multiple of 8.
+        if (o + 1) * 8 % FLUSH_EVERY == 0 || o + 1 == octs {
+            let magic_i = vdupq_n_u32(0x4B00_0000);
+            let magic_f = vdupq_n_f32(8_388_608.0);
+            let zero16 = vdupq_n_u16(0);
+            for i in 0..4 {
+                let lo_u = vreinterpretq_u32_u16(vzip1q_u16(accum[i], zero16));
+                let hi_u = vreinterpretq_u32_u16(vzip2q_u16(accum[i], zero16));
+                let lo = vsubq_f32(vreinterpretq_f32_u32(vorrq_u32(lo_u, magic_i)), magic_f);
+                let hi = vsubq_f32(vreinterpretq_f32_u32(vorrq_u32(hi_u, magic_i)), magic_f);
+                fa[i * 2] = vfmaq_f32(fa[i * 2], v_scale, lo);
+                fa[i * 2 + 1] = vfmaq_f32(fa[i * 2 + 1], v_scale, hi);
+            }
+            accum = [vdupq_n_u16(0); 4];
+        }
+    }
+
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let out_ptr = out.as_mut_ptr();
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    if end - base_vec == BLOCK {
+        for i in 0..8 {
+            let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+            vst1q_f32(out_ptr.add(i * 4), vmulq_f32(fa[i], n));
+        }
+    } else {
+        let mut float_accum = [0.0f32; BLOCK];
+        for i in 0..8 {
+            vst1q_f32(float_accum.as_mut_ptr().add(i * 4), fa[i]);
+        }
+        for lane in 0..BLOCK {
+            *out_ptr.add(lane) = if lane < end - base_vec {
+                float_accum[lane] * *vec_scales_ptr.add(lane)
+            } else {
+                f32::NEG_INFINITY
+            };
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn score_4bit_block_neon(
+    blocked_codes: &[u8],
+    uint8_luts: &[u8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    scale: f32,
+    bias: f32,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [f32; BLOCK],
+) {
+    score_lut_block_neon::<false>(
+        blocked_codes, uint8_luts, block_offset, n_byte_groups, scale, bias, vec_scales,
+        base_vec, n_vectors, out,
+    )
+}
+
+/// H102: [`score_4bit_block_neon`] for tables capped at
+/// [`SIGN_LUT_CAP_NEON`]. Eight lookups then fit a u8, so four byte-groups
+/// are summed in u8 and widened once instead of once per group.
+///
+/// Single-query only. The 4-query kernel does not take the same change:
+/// with 16 u16 accumulators it has no registers for the u8 partials
+/// (x0.95 as written, x0.90 scanning a block in two halves).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn score_sign_block_neon(
+    blocked_codes: &[u8],
+    uint8_luts: &[u8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    scale: f32,
+    bias: f32,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [f32; BLOCK],
+) {
+    score_lut_block_neon::<true>(
+        blocked_codes, uint8_luts, block_offset, n_byte_groups, scale, bias, vec_scales,
+        base_vec, n_vectors, out,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_lut_block_neon<const DEFER: bool>(
     blocked_codes: &[u8],
     uint8_luts: &[u8],
     block_offset: usize,
@@ -78,6 +637,29 @@ unsafe fn score_4bit_block_neon(
 
         // 4-group unrolled inner loop. Interleaves lookups to hide latency of vqtbl1q_u8
         let mut g = g_start;
+        if DEFER {
+            while g + 3 < g_end {
+                let lp = luts_base.add(g * 32);
+                let cp = codes_base.add(g * BLOCK);
+                let mut t0 = vdupq_n_u8(0);
+                let mut t1 = vdupq_n_u8(0);
+                for j in 0..4 {
+                    let lut_hi = vld1q_u8(lp.add(j * 32));
+                    let lut_lo = vld1q_u8(lp.add(j * 32 + 16));
+                    let c0 = vld1q_u8(cp.add(j * BLOCK));
+                    let c1 = vld1q_u8(cp.add(j * BLOCK + 16));
+                    let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c0, 4)));
+                    let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c1, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c1, 4)));
+                    t0 = if j == 0 { s0 } else { vaddq_u8(t0, s0) };
+                    t1 = if j == 0 { s1 } else { vaddq_u8(t1, s1) };
+                }
+                accum[0] = vaddw_u8(accum[0], vget_low_u8(t0));
+                accum[1] = vaddw_u8(accum[1], vget_high_u8(t0));
+                accum[2] = vaddw_u8(accum[2], vget_low_u8(t1));
+                accum[3] = vaddw_u8(accum[3], vget_high_u8(t1));
+                g += 4;
+            }
+        }
         while g + 3 < g_end {
             let lp0 = luts_base.add(g * 32);
             let lp1 = luts_base.add((g + 1) * 32);
@@ -178,7 +760,7 @@ unsafe fn search_multi_query_avx2(
     k: usize,
     mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
-    heap_indices: &mut [Vec<u32>],
+    heap_indices: &mut [Vec<u64>],
     heap_sizes: &mut [usize],
     heap_mins: &mut [f32],
     heap_min_idxs: &mut [usize],
@@ -327,21 +909,19 @@ unsafe fn search_multi_query_avx2(
                     let score = block_out[lane];
                     if *sz < k {
                         hs[*sz] = score;
-                        hi[*sz] = (base_vec + lane) as u32;
+                        hi[*sz] = (base_vec + lane) as u64;
                         *sz += 1;
                         if *sz == k {
-                            *hmin = hs[0]; *hmi = 0;
-                            for h in 1..k {
-                                if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                            }
+                            let (m, mi) = rescan_min(hs, hi, k);
+                            *hmin = m;
+                            *hmi = mi;
                         }
                     } else if score > *hmin {
                         hs[*hmi] = score;
-                        hi[*hmi] = (base_vec + lane) as u32;
-                        *hmin = hs[0]; *hmi = 0;
-                        for h in 1..k {
-                            if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                        }
+                        hi[*hmi] = (base_vec + lane) as u64;
+                        let (m, mi) = rescan_min(hs, hi, k);
+                        *hmin = m;
+                        *hmi = mi;
                     }
                 }
             } else {
@@ -361,12 +941,10 @@ unsafe fn search_multi_query_avx2(
                         let score = block_out[lane];
                         if score > *hmin {
                             hs[*hmi] = score;
-                            hi[*hmi] = (base_vec + lane) as u32;
-                            *hmi = 0;
-                            for h in 1..k {
-                                if hs[h] < hs[*hmi] { *hmi = h; }
-                            }
-                            *hmin = hs[*hmi];
+                            hi[*hmi] = (base_vec + lane) as u64;
+                            let (m, mi) = rescan_min(hs, hi, k);
+                            *hmin = m;
+                            *hmi = mi;
                         }
                     }
                 }
@@ -412,7 +990,7 @@ unsafe fn search_multi_query_avx512bw(
     k: usize,
     mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
-    heap_indices: &mut [Vec<u32>],
+    heap_indices: &mut [Vec<u64>],
     heap_sizes: &mut [usize],
     heap_mins: &mut [f32],
     heap_min_idxs: &mut [usize],
@@ -466,27 +1044,26 @@ unsafe fn search_multi_query_avx512bw(
         ];
         let mut fa_b1 = fa_b0;
 
-        // Batch the inner loop by FLUSH_EVERY=256 byte-groups. The inner loop
-        // already processes byte-groups in pairs for ILP (2 groups per `gp`),
-        // so we step by `n_pairs_per_flush = FLUSH_EVERY / 2 = 128` pairs.
-        let n_group_pairs_inner = n_byte_groups / 2;
-        let n_pairs_per_flush = FLUSH_EVERY / 2;
-        let n_batches = if n_group_pairs_inner == 0 {
-            0
-        } else {
-            (n_group_pairs_inner + n_pairs_per_flush - 1) / n_pairs_per_flush
-        };
+        // Batch the inner loop by FLUSH_EVERY=256 byte-groups, exactly as the
+        // NEON and AVX2 kernels do, so the f32 fmadd flush boundaries — and
+        // therefore the rounding — are identical across architectures. The
+        // inner loop consumes two byte-groups per iteration for ILP; because
+        // FLUSH_EVERY is even, every batch starts on an even group index and
+        // the odd-group tail below can only fire on the final batch.
+        debug_assert!(FLUSH_EVERY % 2 == 0);
+        let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
 
         for batch in 0..n_batches {
-            let gp_start = batch * n_pairs_per_flush;
-            let gp_end = ((batch + 1) * n_pairs_per_flush).min(n_group_pairs_inner);
+            let g_start = batch * FLUSH_EVERY;
+            let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
 
             // Each zmm holds 32 u16 values: lower 256 bits = block b0's state,
             // upper 256 bits = block b1's. Reset per batch.
             let mut accus = [[_mm512_setzero_si512(); 4]; 4];
 
-            for gp in gp_start..gp_end {
-                let g0 = gp * 2;
+            let mut g_pair = g_start;
+            while g_pair + 1 < g_end {
+                let g0 = g_pair;
                 let g1 = g0 + 1;
 
                 let cp0_a = codes_base.add((b0 * n_byte_groups + g0) * BLOCK);
@@ -534,38 +1111,37 @@ unsafe fn search_multi_query_avx512bw(
                         _mm512_add_epi16(_mm512_srli_epi16(res1_a, 8), _mm512_srli_epi16(res1_b, 8)),
                     );
                 }
+
+                g_pair += 2;
             }
 
-            // Tail: any odd last byte-group of this BATCH that isn't part of
-            // a pair. Only fires on the very last batch when n_byte_groups is
-            // odd — current codebook shapes always produce even n_byte_groups
-            // so this is defensive only.
-            if batch == n_batches - 1 {
-                let tail_start = n_group_pairs_inner * 2;
-                for g in tail_start..n_byte_groups {
-                    let cp0 = codes_base.add((b0 * n_byte_groups + g) * BLOCK);
-                    let cp1 = codes_base.add((b1 * n_byte_groups + g) * BLOCK);
-                    let codes_low = _mm256_loadu_si256(cp0 as *const __m256i);
-                    let codes_high = _mm256_loadu_si256(cp1 as *const __m256i);
-                    let codes_v = _mm512_inserti64x4(
-                        _mm512_castsi256_si512(codes_low),
-                        codes_high,
-                        1,
-                    );
-                    let clo = _mm512_and_si512(codes_v, mask512);
-                    let chi = _mm512_and_si512(_mm512_srli_epi16(codes_v, 4), mask512);
+            // Tail: the odd last byte-group of this batch, when the batch holds
+            // an odd number of groups. Only reachable on the final batch (see
+            // the FLUSH_EVERY parity note above); current codebook shapes
+            // always produce even n_byte_groups so this is defensive only.
+            for g in g_pair..g_end {
+                let cp0 = codes_base.add((b0 * n_byte_groups + g) * BLOCK);
+                let cp1 = codes_base.add((b1 * n_byte_groups + g) * BLOCK);
+                let codes_low = _mm256_loadu_si256(cp0 as *const __m256i);
+                let codes_high = _mm256_loadu_si256(cp1 as *const __m256i);
+                let codes_v = _mm512_inserti64x4(
+                    _mm512_castsi256_si512(codes_low),
+                    codes_high,
+                    1,
+                );
+                let clo = _mm512_and_si512(codes_v, mask512);
+                let chi = _mm512_and_si512(_mm512_srli_epi16(codes_v, 4), mask512);
 
-                    for qi in 0..4 {
-                        let lut_low =
-                            _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
-                        let lut = _mm512_broadcast_i64x4(lut_low);
-                        let res0 = _mm512_shuffle_epi8(lut, clo);
-                        let res1 = _mm512_shuffle_epi8(lut, chi);
-                        accus[qi][0] = _mm512_add_epi16(accus[qi][0], res0);
-                        accus[qi][1] = _mm512_add_epi16(accus[qi][1], _mm512_srli_epi16(res0, 8));
-                        accus[qi][2] = _mm512_add_epi16(accus[qi][2], res1);
-                        accus[qi][3] = _mm512_add_epi16(accus[qi][3], _mm512_srli_epi16(res1, 8));
-                    }
+                for qi in 0..4 {
+                    let lut_low =
+                        _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
+                    let lut = _mm512_broadcast_i64x4(lut_low);
+                    let res0 = _mm512_shuffle_epi8(lut, clo);
+                    let res1 = _mm512_shuffle_epi8(lut, chi);
+                    accus[qi][0] = _mm512_add_epi16(accus[qi][0], res0);
+                    accus[qi][1] = _mm512_add_epi16(accus[qi][1], _mm512_srli_epi16(res0, 8));
+                    accus[qi][2] = _mm512_add_epi16(accus[qi][2], res1);
+                    accus[qi][3] = _mm512_add_epi16(accus[qi][3], _mm512_srli_epi16(res1, 8));
                 }
             }
 
@@ -696,6 +1272,633 @@ unsafe fn search_multi_query_avx512bw(
 /// FMAs `v_scale * partial` into the running f32 accumulators `fa`. Mirrors
 /// the per-flush fmadd sequence used by `score_4bit_block_neon` on ARM so
 /// scores across arches differ only by tied-rank f32 swaps.
+// =============================================================================
+// Vector-major VNNI scoring kernel for x86_64 (AVX-512 VBMI + VNNI)
+// =============================================================================
+//
+// Scores a block of 32 vectors against 4 queries using `vpermb` for the table
+// lookup and `vpdpbusd` for the accumulation, over codes in the vector-major
+// layout (see `pack::vector_major_chunk`).
+//
+// Why a dot-product instruction is legal here at all: in the classic layout
+// adjacent code bytes belong to different database vectors, so `vpdpbusd`'s
+// 4-byte reduction would mix them. Vector-major puts one vector's codes for
+// four consecutive byte-groups in each aligned 4-byte group, so the reduction
+// sums four byte-groups *for that vector* and lands in that vector's dword
+// lane. `vpermb`'s 6-bit index then lets byte position `j` select a different
+// 16-entry sub-table from a 64-byte concatenation — which `vpshufb` cannot do,
+// since it applies one 16-byte table per 128-bit lane.
+//
+// Two consequences beyond the op count: accumulation is u32, so there is no
+// u16 overflow and hence no periodic f32 flush (the score rounds once at the
+// end rather than every FLUSH_EVERY groups — more accurate, but NOT
+// bit-identical to the classic kernel); and one accumulator per 16 vectors
+// per query replaces the classic kernel's 16 live zmm.
+//
+// Measured x1.52 on the inner sequence and x1.388 over a full 73 MB scan; see
+// `benchmarks/hillclimb/LOG_search.md` (P11-P13).
+/// Picks the prefetching instantiation for a single-query sweep and the
+/// bare one for a batch (H6).
+///
+/// The depth-8 lookahead is worth +16% at nq=1 ST and costs ~5% at nq=100,
+/// because a 2-bit block is half a 4-bit block: H62's distance runs two
+/// thirds of a block ahead here and evicts what the next pass re-reads. A
+/// batch re-reads; a single sweep does not.
+///
+/// # Safety
+/// Same contract as [`search_multi_query_vnni`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vnni", enable = "avx512vl", enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn search_multi_query_vnni_dispatch(
+    blocked_codes: &[u8],
+    split_luts: &[&[u8]],
+    scales: &[f32],
+    biases: &[f32],
+    n_byte_groups: usize,
+    block_bytes: usize,
+    vec_scales: &[f32],
+    n_vectors: usize,
+    nq: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    if nq == 1 {
+        search_single_query_vnni_blk2(
+            blocked_codes, split_luts, scales, biases, n_byte_groups, block_bytes, vec_scales,
+            n_vectors, k, mask, heap_scores, heap_indices, heap_sizes,
+            heap_mins, heap_min_idxs,
+        )
+    } else {
+        // H53: the batch width is a const generic so the per-query loop
+        // unrolls with no trip-count test, no slice bounds check and no
+        // accumulator spill per quad. One instantiation per width 2..=8:
+        // the sweep gate caught that padding a narrow batch up to 4 or 8
+        // (H53's first cut) costs nq=2 and nq=5 12-14%, so every width does
+        // exactly its own work. The driver pads `split_luts`, `scales` and
+        // `biases` to the batch width, so indices up to `nq` are valid.
+        macro_rules! vnni_nq {
+            ($n:literal) => {
+                search_multi_query_vnni::<false, $n>(
+                    blocked_codes, split_luts, scales, biases, n_byte_groups, block_bytes,
+                    vec_scales, n_vectors, nq, k, mask, heap_scores, heap_indices, heap_sizes,
+                    heap_mins, heap_min_idxs,
+                )
+            };
+        }
+        debug_assert!(split_luts.len() >= nq && scales.len() >= nq && biases.len() >= nq);
+        match nq {
+            2 => vnni_nq!(2),
+            3 => vnni_nq!(3),
+            4 => vnni_nq!(4),
+            5 => vnni_nq!(5),
+            6 => vnni_nq!(6),
+            7 => vnni_nq!(7),
+            _ => vnni_nq!(8),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx2",
+    enable = "fma",
+    enable = "avx512f",
+    enable = "avx512bw",
+    enable = "avx512vbmi",
+    enable = "avx512vnni"
+)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn search_multi_query_vnni<const PF: bool, const NQ: usize>(
+    blocked_codes: &[u8],
+    split_luts: &[&[u8]],
+    scales: &[f32],
+    biases: &[f32],
+    n_byte_groups: usize,
+    block_bytes: usize,
+    vec_scales: &[f32],
+    n_vectors: usize,
+    nq: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+
+    // 8-wide by construction: `acc` is `[[__m512i; 2]; 8]` and both the
+    // accumulation and epilogue loops clamp at `nq.min(8)`, so a wider
+    // batch would be silently truncated, not scored. The batch dispatch
+    // widens `nq_batch` past 8 only when the 10-lane permute-dot kernel
+    // is the one taking the batch (see the width gate there).
+    debug_assert!(nq <= NQ, "search_multi_query_vnni::<_, {NQ}> got nq={nq}");
+    // H53: fixed-size copies so every per-query access in the hot loop is a
+    // constant index into a local array — no slice bounds check, and the
+    // accumulators stay in zmm for the whole block.
+    let lut_ptrs: [*const u8; NQ] = std::array::from_fn(|i| split_luts[i].as_ptr());
+    let sc: [f32; NQ] = std::array::from_fn(|i| scales[i]);
+    let bi: [f32; NQ] = std::array::from_fn(|i| biases[i]);
+
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let m0f = _mm512_set1_epi8(0x0F);
+    // Per 32-bit lane: byte j of each vector's 4-byte group gets (j << 4), so
+    // the permute index becomes (j << 4) | code.
+    let kpos = _mm512_set1_epi32(0x3020_1000u32 as i32);
+    let ones = _mm512_set1_epi8(1);
+    let quads = n_byte_groups / 4;
+
+    for b in 0..n_blocks {
+        let base_vec = b * BLOCK;
+        if !block_has_allowed(mask, base_vec) {
+            continue;
+        }
+        let block_base = b * block_bytes;
+        // acc[q][h]: 16 u32 lanes = 16 vectors, halves h = vectors 0-15, 16-31.
+        // Up to 8 queries: 16 zmm live, against the classic kernel's 16 at
+        // only 4 queries.
+        let mut acc = [[_mm512_setzero_si512(); 2]; NQ];
+
+        for q4 in 0..quads {
+            for h in 0..2 {
+                // H4: this kernel had no prefetch at all, while the 4-bit
+                // permute-dot path has had one since H59/H62 — the same
+                // multi-sweep re-streaming, and at 2 bits nq=100 sweeps 13
+                // times over 38.4 MB. Depth follows H62's measured knee: 32
+                // quads when the batch re-reads the codes, 8 at nq=1 where a
+                // single sweep overshoots.
+                // H5: only the single-query sweep wants it here. At nq=1 the
+                // depth-8 lookahead is worth +10.8% ST; at nq=100 the same
+                // idea costs ~5%, because a 2-bit block is half a 4-bit block,
+                // so H62's 32-quad depth runs two thirds of a block ahead
+                // instead of one third and evicts what the next pass is about
+                // to re-read. The batch re-reads; the single sweep does not.
+                // `PF` is const so the batched instantiation emits no branch
+                // at all: nq=100 must be machine-identical to main, or the
+                // no-regression gate is measuring a test it cannot see.
+                if PF {
+                    let pf = block_base + (q4 + 8) * 128 + h * 64;
+                    if pf + 64 <= blocked_codes.len() {
+                        _mm_prefetch(blocked_codes.as_ptr().add(pf) as *const i8, _MM_HINT_T0);
+                    }
+                }
+                let c = _mm512_loadu_si512(
+                    blocked_codes.as_ptr().add(block_base + q4 * 128 + h * 64) as *const __m512i,
+                );
+                let ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
+                let ihi = _mm512_or_si512(
+                    _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f),
+                    kpos,
+                );
+                for qi in 0..NQ {
+                    let tp = lut_ptrs[qi].add(q4 * 128);
+                    let tlo = _mm512_loadu_si512(tp as *const __m512i);
+                    let thi = _mm512_loadu_si512(tp.add(64) as *const __m512i);
+                    acc[qi][h] = _mm512_dpbusd_epi32(
+                        acc[qi][h],
+                        _mm512_permutexvar_epi8(ilo, tlo),
+                        ones,
+                    );
+                    acc[qi][h] = _mm512_dpbusd_epi32(
+                        acc[qi][h],
+                        _mm512_permutexvar_epi8(ihi, thi),
+                        ones,
+                    );
+                }
+            }
+        }
+
+        let end = (base_vec + BLOCK).min(n_vectors);
+        for qi in 0..NQ {
+            // H11: convert and bias at full width and hand two __m512 to the
+            // 512-bit epilogue, exactly as the 4-bit permute-dot path has
+            // done since H111 (+5.9% MT / +7.7% ST there). This kernel was
+            // still splitting into four __m256 for the AVX2 epilogue — P6
+            // priced the shipped cell 25% under the inner loop's roofline,
+            // and this per-(block, query) code is where that gap lives.
+            let vs = _mm512_set1_ps(sc[qi]);
+            let vb = _mm512_set1_ps(bi[qi]);
+            let f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][0]), vs), vb);
+            let f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][1]), vs), vb);
+            // H60: the helper's common case — a full block, a filled heap and
+            // no lane above the heap minimum — is two multiplies, two
+            // compares and a mask test, but reaching it was an out-of-line
+            // call with thirteen arguments that forced every live
+            // accumulator to the stack first, six times per block. The test
+            // runs here on the same values; the helper is entered only when
+            // a lane can enter the heap, and recomputes the same products,
+            // so scores and tie order are unchanged.
+            if (heap_sizes[qi] >= k || heap_min_idxs[qi] == HEAP_BUFFERED)
+                && end - base_vec == BLOCK
+            {
+                let vsp = vec_scales.as_ptr().add(base_vec);
+                let s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(vsp));
+                let s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(vsp.add(16)));
+                let thr = _mm512_set1_ps(heap_mins[qi]);
+                let m0 = _mm512_cmp_ps_mask(s0, thr, _CMP_GT_OQ) as u32;
+                let m1 = _mm512_cmp_ps_mask(s1, thr, _CMP_GT_OQ) as u32;
+                if (m0 | m1) == 0 {
+                    continue;
+                }
+            }
+            avx512_post_flush_heap_update(
+                f0,
+                f1,
+                base_vec,
+                end,
+                vec_scales.as_ptr().add(base_vec),
+                qi,
+                k,
+                mask,
+                heap_scores,
+                heap_indices,
+                heap_sizes,
+                heap_mins,
+                heap_min_idxs,
+            );
+        }
+    }
+}
+
+/// Two-block interleaved single-query scan (H34, re-opening H13).
+///
+/// The 4-bit climb's H54 found x1.29 at nq=1 ST on x86 by giving the scan
+/// several independent block streams: one stream leaves the core waiting on a
+/// single miss chain and the fill buffers can hold far more. The 2-bit kernel
+/// never got it, and H13 closed the cell on a roofline that P18 has since
+/// shown was measured with a probe slower than the kernel it bounded.
+///
+/// Two blocks in flight, one query: 4 zmm of accumulator, and each quad's
+/// table load is shared between them, so per-block table traffic halves too.
+///
+/// # Safety
+/// Same contract as [`search_multi_query_vnni`]; `nq` must be 1.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx2",
+    enable = "fma",
+    enable = "avx512f",
+    enable = "avx512bw",
+    // vbmi is what makes `vpermb` a real instruction. Without it LLVM
+    // emulates `_mm512_permutexvar_epi8` and the kernel runs 3x slower —
+    // the first two builds of this hypothesis measured exactly that, and
+    // the feature list, not the loop structure, was the defect.
+    enable = "avx512vbmi",
+    enable = "avx512vnni"
+)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn search_single_query_vnni_blk2(
+    blocked_codes: &[u8],
+    split_luts: &[&[u8]],
+    scales: &[f32],
+    biases: &[f32],
+    n_byte_groups: usize,
+    block_bytes: usize,
+    vec_scales: &[f32],
+    n_vectors: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let m0f = _mm512_set1_epi8(0x0F);
+    let kpos = _mm512_set1_epi32(0x3020_1000u32 as i32);
+    let ones = _mm512_set1_epi8(1);
+    let quads = n_byte_groups / 4;
+
+    // Pairs are unrolled at compile time. `pair` as a runtime bound made
+    // `acc[i][h]` a runtime index, which LLVM cannot hold in registers — it
+    // spilled every accumulator to the stack and the first build measured
+    // x0.34. Same trap H34 documented in the 4-bit log for runtime batch
+    // widths; the odd tail block goes through its own straight-line copy.
+    // Two streams, not four: H35 measured BLK=4 at 1.37 ms against this
+    // shape's 1.30 on the same box. Two blocks is enough to cover the miss
+    // latency and four doubles the live accumulators and code registers for
+    // nothing.
+    let n_pairs = n_blocks / 2;
+    for pb in 0..n_pairs {
+        let b = pb * 2;
+        if !block_has_allowed(mask, b * BLOCK) && !block_has_allowed(mask, (b + 1) * BLOCK) {
+            continue;
+        }
+        let base0 = b * block_bytes;
+        let base1 = base0 + block_bytes;
+        let mut a0 = [_mm512_setzero_si512(); 2];
+        let mut a1 = [_mm512_setzero_si512(); 2];
+
+        for q4 in 0..quads {
+            for h in 0..2 {
+                let pf = base0 + (q4 + 8) * 128 + h * 64;
+                if pf + 64 <= blocked_codes.len() {
+                    _mm_prefetch(blocked_codes.as_ptr().add(pf) as *const i8, _MM_HINT_T0);
+                }
+                let tp = split_luts[0].as_ptr().add(q4 * 128);
+                let tlo = _mm512_loadu_si512(tp as *const __m512i);
+                let thi = _mm512_loadu_si512(tp.add(64) as *const __m512i);
+                let c0 = _mm512_loadu_si512(
+                    blocked_codes.as_ptr().add(base0 + q4 * 128 + h * 64) as *const __m512i);
+                let c1 = _mm512_loadu_si512(
+                    blocked_codes.as_ptr().add(base1 + q4 * 128 + h * 64) as *const __m512i);
+                let i0lo = _mm512_or_si512(_mm512_and_si512(c0, m0f), kpos);
+                let i0hi = _mm512_or_si512(
+                    _mm512_and_si512(_mm512_srli_epi16(c0, 4), m0f), kpos);
+                let i1lo = _mm512_or_si512(_mm512_and_si512(c1, m0f), kpos);
+                let i1hi = _mm512_or_si512(
+                    _mm512_and_si512(_mm512_srli_epi16(c1, 4), m0f), kpos);
+                a0[h] = _mm512_dpbusd_epi32(a0[h], _mm512_permutexvar_epi8(i0lo, tlo), ones);
+                a0[h] = _mm512_dpbusd_epi32(a0[h], _mm512_permutexvar_epi8(i0hi, thi), ones);
+                a1[h] = _mm512_dpbusd_epi32(a1[h], _mm512_permutexvar_epi8(i1lo, tlo), ones);
+                a1[h] = _mm512_dpbusd_epi32(a1[h], _mm512_permutexvar_epi8(i1hi, thi), ones);
+            }
+        }
+
+        let vs = _mm512_set1_ps(scales[0]);
+        let vb = _mm512_set1_ps(biases[0]);
+        for (i, a) in [a0, a1].iter().enumerate() {
+            let base_vec = (b + i) * BLOCK;
+            let end = (base_vec + BLOCK).min(n_vectors);
+            let f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
+            let f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
+            avx512_post_flush_heap_update(
+                f0, f1, base_vec, end, vec_scales.as_ptr().add(base_vec), 0, k, mask,
+                heap_scores, heap_indices, heap_sizes, heap_mins, heap_min_idxs,
+            );
+        }
+    }
+
+    // Tail blocks, single-stream.
+    for b in (n_pairs * 2)..n_blocks {
+        if block_has_allowed(mask, b * BLOCK) {
+            let base = b * block_bytes;
+            let mut a = [_mm512_setzero_si512(); 2];
+            for q4 in 0..quads {
+                for h in 0..2 {
+                    let tp = split_luts[0].as_ptr().add(q4 * 128);
+                    let tlo = _mm512_loadu_si512(tp as *const __m512i);
+                    let thi = _mm512_loadu_si512(tp.add(64) as *const __m512i);
+                    let c = _mm512_loadu_si512(
+                        blocked_codes.as_ptr().add(base + q4 * 128 + h * 64) as *const __m512i);
+                    let ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
+                    let ihi = _mm512_or_si512(
+                        _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f), kpos);
+                    a[h] = _mm512_dpbusd_epi32(a[h], _mm512_permutexvar_epi8(ilo, tlo), ones);
+                    a[h] = _mm512_dpbusd_epi32(a[h], _mm512_permutexvar_epi8(ihi, thi), ones);
+                }
+            }
+            let base_vec = b * BLOCK;
+            let end = (base_vec + BLOCK).min(n_vectors);
+            let vs = _mm512_set1_ps(scales[0]);
+            let vb = _mm512_set1_ps(biases[0]);
+            let f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
+            let f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
+            avx512_post_flush_heap_update(
+                f0, f1, base_vec, end, vec_scales.as_ptr().add(base_vec), 0, k, mask,
+                heap_scores, heap_indices, heap_sizes, heap_mins, heap_min_idxs,
+            );
+        }
+    }
+}
+
+/// Permute-dot scan over the vector-major layout (4-bit codes).
+///
+/// Same shape as [`search_multi_query_vnni`], with the per-query `vpermb`
+/// replaced by one `vpshufb` pair *shared* across every query in the batch:
+/// the nibble -> level map is the codebook itself, which no query depends
+/// on. Per 64 bytes of codes, per query, that turns
+///
+///   2 x 64-byte LUT load + 2 `vpermb` + 2 `vpdpbusd`
+///
+/// into a 4-byte broadcast and 2 `vpdpbusd` — the query-side table traffic
+/// drops from 128 bytes per group to 8, and the two shuffles amortize across
+/// the batch instead of repeating per query.
+///
+/// No accumulator flush: `vpdpbusd` reduces into i32 lanes and the widest
+/// possible sum over 768 dimensions is `768 * 255 * 127` ≈ 2.5e7, three
+/// orders of magnitude inside i32. That removes the `FLUSH_EVERY` cadence
+/// and, with it, the 7-bit table cap the flush imposed.
+///
+/// `NQ` is a const generic, and that is load-bearing rather than tidiness.
+/// With a runtime batch width `acc[qi]` is a runtime index into an array,
+/// which LLVM cannot hold in registers: it spilled all 16 accumulators to
+/// the stack and wrapped every pair of `vpdpbusd` in a 64-byte reload and
+/// 64-byte store, plus two pointer chases and a bounds branch, because the
+/// query loop never unrolled either. A fixed-size array makes every index a
+/// constant, the loop unrolls, and the accumulators stay in `zmm`. See H34.
+///
+/// Callers pass a batch padded to `NQ` and the real count in `nq`; the
+/// padding lanes are scored and discarded, which costs nothing measurable
+/// (the epilogue is ~2% of runtime) and keeps the hot loop branch-free.
+///
+/// See P18 in `benchmarks/hillclimb/LOG_search.md`.
+/// Whether this core has GFNI, cached after the first probe.
+///
+/// AVX-512 VNNI and GFNI are not the same generation: Cascade Lake has VNNI
+/// without GFNI, so the affine-shift kernel cannot be selected by the same
+/// gate as permute-dot itself.
+///
+/// `TURBOVEC_NO_GFNI` forces the baseline kernel. Without it the fallback is
+/// unreachable on any machine this is developed or benchmarked on — both
+/// bench boxes and every current dev machine have GFNI — so the escape hatch
+/// is what keeps that path testable rather than merely present. Same role as
+/// `TURBOVEC_NO_I8MM` on aarch64.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn have_gfni() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var_os("TURBOVEC_NO_GFNI").is_none() && is_x86_feature_detected!("gfni")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! define_permute_dot {
+    ($name:ident, [$($feature:literal),*], |$c:ident, $mask:ident| $hi:expr) => {
+
+        #[target_feature($(enable = $feature),*)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $name<const NQ: usize, const BLK: usize>(
+    blocked_codes: &[u8],
+    pds: &[&QueryPermuteDot; NQ],
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    n_vectors: usize,
+    nq: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let m0f = _mm512_set1_epi8(0x0F);
+    let quads = n_byte_groups / 4;
+    let block_bytes = n_byte_groups * BLOCK;
+    let nqm = nq.min(NQ);
+
+    // `vpshufb` indexes within each 128-bit lane, so the same 16 entries are
+    // broadcast to all four. Every query in the batch shares this table —
+    // they are all scoring against one index, hence one codebook.
+    //
+    // XOR by 0x80 is the +128 bias that puts the signed level table into
+    // `vpdpbusd`'s unsigned operand range; `zero` cancels it. Hoisted out of
+    // the block loop, so it is one instruction for the whole scan.
+    let levels = _mm512_xor_si512(
+        _mm512_broadcast_i32x4(_mm_loadu_si128(pds[0].levels.as_ptr() as *const __m128i)),
+        _mm512_set1_epi8(0x80u8 as i8),
+    );
+
+    for b in (0..n_blocks).step_by(BLK) {
+        let base_vec = b * BLOCK;
+        // The skip must clear the WHOLE interleaved group: H54 steps this
+        // loop by BLK blocks, and testing only the head block's mask word
+        // silently dropped allowed vectors in blocks 2..BLK of a group
+        // whose head was fully masked (caught by the masked filtering
+        // suite on AVX-512 hardware — short results padded with the
+        // heap prefill, surfacing as disallowed slot 0).
+        let group_blocks = BLK.min(n_blocks - b);
+        if !(0..group_blocks).any(|s| block_has_allowed(mask, base_vec + s * BLOCK)) {
+            continue;
+        }
+        let block_base = b * block_bytes;
+        // acc[q][h]: 16 i32 lanes = 16 vectors, halves h = vectors 0-15,
+        // 16-31. Seeded with the +128 cancellation rather than zero.
+        // `BLK` blocks interleaved inside the quad loop, so the kernel walks
+        // BLK independent sequential streams instead of one.
+        //
+        // P24 measured x86 nq=1 as memory-bound once the array leaves cache
+        // (14.5 -> 31.5 ns/vec, 38 MB -> 154 MB) while arm stays flat. H43
+        // (prefetch) and H49 (more accumulator chains) both failed there, and
+        // for the same unstated reason: neither adds a memory *stream*. One
+        // query walks one stream, so outstanding misses are capped at what a
+        // single stream sustains. At NQ=8 the registers are full and BLK=1;
+        // at NQ=1 only two accumulators are live and there is room. See H54.
+        let nb = BLK.min(n_blocks - b);
+        let mut acc = [[[_mm512_setzero_si512(); 2]; NQ]; BLK];
+        for sub in 0..nb {
+            for (a, pd) in acc[sub].iter_mut().zip(pds.iter()) {
+                let z = _mm512_set1_epi32(pd.zero);
+                a[0] = z;
+                a[1] = z;
+            }
+        }
+
+        for q4 in 0..quads {
+            for h in 0..2 {
+              for sub in 0..nb {
+                let block_base = block_base + sub * block_bytes;
+                let acc = &mut acc[sub];
+                // One line per 64-byte load, a fixed distance ahead — the
+                // competent shape from H43, which measured neutral at
+                // nq=100 when that cell was compute-bound. P28 showed it no
+                // longer is: crossing out of cache now costs 34% there,
+                // against 4% when H43 was taken. See H59.
+                // Lookahead depends on the batch width, because the two
+                // widths make different use of the array. At nq=100 the
+                // scan sweeps it 12.5 times and a deep 4 KB lookahead is
+                // worth +25% ST; at nq=1 it sweeps once and the same depth
+                // overshoots, costing 6%. Measured: 32 quads is the knee at
+                // NQ=8 (64/96/128 are indistinguishable) and 8 at NQ=1.
+                // See H62.
+                let pf_quads = if NQ == 1 { 8 } else { 32 };
+                {
+                    let pf = block_base + (q4 + pf_quads) * 128 + h * 64;
+                    if pf + 64 <= blocked_codes.len() {
+                        _mm_prefetch(blocked_codes.as_ptr().add(pf) as *const i8, _MM_HINT_T0);
+                    }
+                }
+                let c = _mm512_loadu_si512(
+                    blocked_codes.as_ptr().add(block_base + q4 * 128 + h * 64) as *const __m512i,
+                );
+                // Shared across the whole batch — this is the whole point.
+                let vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c, m0f));
+                let vhi = _mm512_shuffle_epi8(levels, { let ($c, $mask) = (c, m0f); $hi });
+                for qi in 0..NQ {
+                    // Four dimensions of query weights, broadcast: every
+                    // dword lane holds a different database vector but the
+                    // same four byte-groups. `weights` is `Vec<i8>`, so the
+                    // 4-byte read is unaligned by construction. LLVM folds
+                    // this into `vpdpbusd`'s embedded `{1to16}` broadcast
+                    // operand, so it costs no separate instruction.
+                    let wp = pds[qi].weights.as_ptr().add(q4 * 8);
+                    let wlo = _mm512_set1_epi32((wp as *const i32).read_unaligned());
+                    let whi = _mm512_set1_epi32((wp.add(4) as *const i32).read_unaligned());
+                    acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vlo, wlo);
+                    acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vhi, whi);
+                }
+              }
+            }
+        }
+
+        for sub in 0..nb {
+        let base_vec = base_vec + sub * BLOCK;
+        let acc = &acc[sub];
+        let end = (base_vec + BLOCK).min(n_vectors);
+        for qi in 0..nqm {
+            // H111: stay 512-bit. Two converts and two FMAs replace four
+            // converts, four multiplies, four adds and four 256-bit extracts.
+            let vs = _mm512_set1_ps(pds[qi].scale);
+            let vb = _mm512_set1_ps(pds[qi].bias);
+            let f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[qi][0]), vs, vb);
+            let f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[qi][1]), vs, vb);
+            avx512_post_flush_heap_update(
+                f0,
+                f1,
+                base_vec,
+                end,
+                vec_scales.as_ptr().add(base_vec),
+                qi,
+                k,
+                mask,
+                heap_scores,
+                heap_indices,
+                heap_sizes,
+                heap_mins,
+                heap_min_idxs,
+            );
+        }
+        }
+    }
+}
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+define_permute_dot!(
+    search_multi_query_permute_dot,
+    ["avx2", "fma", "avx512f", "avx512bw", "avx512vnni"],
+    |c, m0f| _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f)
+);
+
+#[cfg(target_arch = "x86_64")]
+define_permute_dot!(
+    search_multi_query_permute_dot_gfni,
+    ["avx2", "fma", "avx512f", "avx512bw", "avx512vnni", "gfni"],
+    // `c >> 4` per byte in one instruction. A logical shift is linear over
+    // GF(2), so `vgf2p8affineqb` computes it as an 8x8 bit-matrix product,
+    // and unlike `vpsrlw` it works a byte at a time — no follow-up AND to
+    // clear the neighbouring bits a 16-bit shift drags in. Two ops become
+    // one, worth x1.039 MT. The matrix is the identity
+    // (0x0102040810204080, since output bit `i` is `parity(A[7-i] & x)`)
+    // keeping only the rows that map input bits 4..7 to output bits 0..3.
+    // See H38.
+    |c, _m0f| _mm512_gf2p8affine_epi64_epi8(c, _mm512_set1_epi64(0x1020408000000000u64 as i64), 0)
+);
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn avx2_batch_flush_to_fa(
@@ -744,7 +1947,7 @@ unsafe fn avx2_post_flush_heap_update(
     k: usize,
     mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
-    heap_indices: &mut [Vec<u32>],
+    heap_indices: &mut [Vec<u64>],
     heap_sizes: &mut [usize],
     heap_mins: &mut [f32],
     heap_min_idxs: &mut [usize],
@@ -797,12 +2000,10 @@ unsafe fn avx2_post_flush_heap_update(
                 let score = block_out[lane];
                 if score > *hmin {
                     hs[*hmi] = score;
-                    hi[*hmi] = (base_vec + lane) as u32;
-                    *hmi = 0;
-                    for h in 1..k {
-                        if hs[h] < hs[*hmi] { *hmi = h; }
-                    }
-                    *hmin = hs[*hmi];
+                    hi[*hmi] = (base_vec + lane) as u64;
+                    let (m, mi) = rescan_min(hs, hi, k);
+                    *hmin = m;
+                    *hmi = mi;
                 }
             }
         }
@@ -833,21 +2034,19 @@ unsafe fn avx2_post_flush_heap_update(
             let score = block_out[lane];
             if *sz < k {
                 hs[*sz] = score;
-                hi[*sz] = (base_vec + lane) as u32;
+                hi[*sz] = (base_vec + lane) as u64;
                 *sz += 1;
                 if *sz == k {
-                    *hmin = hs[0]; *hmi = 0;
-                    for h in 1..k {
-                        if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                    }
+                    let (m, mi) = rescan_min(hs, hi, k);
+                    *hmin = m;
+                    *hmi = mi;
                 }
             } else if score > *hmin {
                 hs[*hmi] = score;
-                hi[*hmi] = (base_vec + lane) as u32;
-                *hmin = hs[0]; *hmi = 0;
-                for h in 1..k {
-                    if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                }
+                hi[*hmi] = (base_vec + lane) as u64;
+                let (m, mi) = rescan_min(hs, hi, k);
+                *hmin = m;
+                *hmi = mi;
             }
         }
     } else {
@@ -867,14 +2066,220 @@ unsafe fn avx2_post_flush_heap_update(
                 let score = block_out[lane];
                 if score > *hmin {
                     hs[*hmi] = score;
-                    hi[*hmi] = (base_vec + lane) as u32;
-                    *hmi = 0;
-                    for h in 1..k {
-                        if hs[h] < hs[*hmi] { *hmi = h; }
-                    }
-                    *hmin = hs[*hmi];
+                    hi[*hmi] = (base_vec + lane) as u64;
+                    let (m, mi) = rescan_min(hs, hi, k);
+                    *hmin = m;
+                    *hmi = mi;
                 }
             }
+        }
+    }
+}
+
+/// The same per-block epilogue at 512 bits, for callers that already have
+/// AVX-512 (H111).
+///
+/// H110 measured 5.3% at x86 nq=100 ST sitting in code the `x86-64-v2`
+/// baseline compiles for pre-AVX2 CPUs — the whole gap is the v3 -> v4 step,
+/// so it is feature availability and not scheduling. The baseline itself
+/// cannot move (#137: the dispatch prologue runs before feature detection),
+/// but a `#[target_feature]` variant reached from the AVX-512 kernel can,
+/// and needs no new runtime check because that kernel already declares the
+/// features.
+///
+/// A block that beats nothing is the overwhelmingly common case at
+/// nq=100 over 200k vectors, so the path that matters is the early exit:
+/// two scale multiplies, two compares and one mask test, against the AVX2
+/// version's four of each. The caller also saves half its convert-and-bias
+/// work by handing over two `__m512` instead of four `__m256`.
+///
+/// Selection itself is untouched — P44 priced that at ~free for k=10, and
+/// this changes only the arithmetic that runs over all 32 lanes regardless.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn avx512_post_flush_heap_update(
+    f0: std::arch::x86_64::__m512,
+    f1: std::arch::x86_64::__m512,
+    base_vec: usize,
+    end: usize,
+    vec_scales_ptr: *const f32,
+    qi: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+
+    let end_lane = end - base_vec;
+    let sz_now = heap_sizes[qi];
+
+    if heap_min_idxs[qi] == HEAP_BUFFERED {
+        let mut block_out = [0.0f32; BLOCK];
+        let mut m: u32 = 0;
+        if end_lane == BLOCK {
+            let s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(vec_scales_ptr));
+            let s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(vec_scales_ptr.add(16)));
+            let thr = _mm512_set1_ps(heap_mins[qi]);
+            m = ((_mm512_cmp_ps_mask(s0, thr, _CMP_GT_OQ) as u32)
+                | ((_mm512_cmp_ps_mask(s1, thr, _CMP_GT_OQ) as u32) << 16))
+                & block_mask_word(mask, base_vec);
+            if m == 0 {
+                return;
+            }
+            _mm512_storeu_ps(block_out.as_mut_ptr(), s0);
+            _mm512_storeu_ps(block_out.as_mut_ptr().add(16), s1);
+        } else {
+            let mut f = [0.0f32; BLOCK];
+            _mm512_storeu_ps(f.as_mut_ptr(), f0);
+            _mm512_storeu_ps(f.as_mut_ptr().add(16), f1);
+            for lane in 0..end_lane {
+                block_out[lane] = f[lane] * *vec_scales_ptr.add(lane);
+                if block_out[lane] > heap_mins[qi] {
+                    m |= 1 << lane;
+                }
+            }
+            m &= block_mask_word(mask, base_vec);
+        }
+        let hs = &mut heap_scores[qi];
+        let hi = &mut heap_indices[qi];
+        let mut sz = sz_now;
+        let mut thr = heap_mins[qi];
+        while m != 0 {
+            let lane = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let score = block_out[lane];
+            if score > thr {
+                hs[sz] = score;
+                hi[sz] = (base_vec + lane) as u64;
+                sz += 1;
+                if sz == k {
+                    thr = compact_half(hs, hi, k);
+                    sz = (k / 2).max(1);
+                }
+            }
+        }
+        heap_sizes[qi] = sz;
+        heap_mins[qi] = thr;
+        return;
+    }
+
+    // Fast path: a full block with a filled heap. Everything else falls back
+    // to the AVX2 routine rather than being duplicated — those paths run once
+    // per scan (heap filling) or once per index (the ragged tail), so a second
+    // copy of them would be all risk and no measurable gain.
+    if sz_now >= k && end_lane == BLOCK {
+        let s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(vec_scales_ptr));
+        let s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(vec_scales_ptr.add(16)));
+        let thr = _mm512_set1_ps(heap_mins[qi]);
+        let m0 = _mm512_cmp_ps_mask(s0, thr, _CMP_GT_OQ) as u32;
+        let m1 = _mm512_cmp_ps_mask(s1, thr, _CMP_GT_OQ) as u32;
+        if (m0 | m1) == 0 {
+            return;
+        }
+
+        let mut block_out = [0.0f32; BLOCK];
+        let bp = block_out.as_mut_ptr();
+        if m0 != 0 {
+            _mm512_storeu_ps(bp, s0);
+        }
+        if m1 != 0 {
+            _mm512_storeu_ps(bp.add(16), s1);
+        }
+
+        let hs = &mut heap_scores[qi];
+        let hi = &mut heap_indices[qi];
+        let hmin = &mut heap_mins[qi];
+        let hmi = &mut heap_min_idxs[qi];
+        for (half, &mask0) in [m0, m1].iter().enumerate() {
+            let mut m = mask0;
+            while m != 0 {
+                let bit = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let lane = half * 16 + bit;
+                if let Some(am) = mask {
+                    if !mask_allows(am, base_vec + lane) {
+                        continue;
+                    }
+                }
+                let score = block_out[lane];
+                // Re-checked because `hmin` rises as this loop inserts, so a
+                // lane that cleared the vector threshold may no longer clear
+                // the current one. Same guard the AVX2 path uses.
+                if score > *hmin {
+                    hs[*hmi] = score;
+                    hi[*hmi] = (base_vec + lane) as u64;
+                    let (m2, mi) = rescan_min(hs, hi, k);
+                    *hmin = m2;
+                    *hmi = mi;
+                }
+            }
+        }
+        return;
+    }
+
+    let fa = [
+        _mm512_extractf32x8_ps(f0, 0),
+        _mm512_extractf32x8_ps(f0, 1),
+        _mm512_extractf32x8_ps(f1, 0),
+        _mm512_extractf32x8_ps(f1, 1),
+    ];
+    avx2_post_flush_heap_update(
+        &fa, base_vec, end, vec_scales_ptr, qi, k, mask,
+        heap_scores, heap_indices, heap_sizes, heap_mins, heap_min_idxs,
+    );
+}
+
+/// The four-query nibble-LUT scan over byte-groups `g0..g1` of one block,
+/// accumulating into `acc`.
+///
+/// Extracted from [`score_4query_block_neon`] so the single-batch case can
+/// run it without the float accumulators live across it (H41). Both callers
+/// inline it, so the instruction stream is unchanged for either.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn scan_groups_neon(
+    codes_base: *const u8,
+    luts: [&[u8]; 4],
+    g0: usize,
+    g1: usize,
+    acc: &mut [[std::arch::aarch64::uint16x8_t; 4]; 4],
+) {
+    use std::arch::aarch64::*;
+
+    let mask = vdupq_n_u8(0x0F);
+    for g in g0..g1 {
+        // H6: no prefetch here. H4/H5 measured one at 32 units — +2.8% at
+        // nq=100 ST and -1.8% at nq=100 MT, because eight workers sharing
+        // L2/L3 pay for a lookahead that one worker profits from. The two
+        // cancel and the MT side breaks the no-regression gate, so the arm
+        // batched kernel keeps the hardware prefetcher it already had.
+        // Load codes ONCE
+        let cp = codes_base.add(g * BLOCK);
+        let c0 = vld1q_u8(cp);
+        let c1 = vld1q_u8(cp.add(16));
+
+        // Split nibbles ONCE
+        let lo0 = vandq_u8(c0, mask);
+        let lo1 = vandq_u8(c1, mask);
+        let hi0 = vshrq_n_u8(c0, 4);
+        let hi1 = vshrq_n_u8(c1, 4);
+
+        // Score 4 queries against the same nibbles
+        for q in 0..4 {
+            let lp = luts[q].as_ptr().add(g * 32);
+            let lut_hi = vld1q_u8(lp);
+            let lut_lo = vld1q_u8(lp.add(16));
+            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, lo0), vqtbl1q_u8(lut_hi, hi0));
+            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, lo1), vqtbl1q_u8(lut_hi, hi1));
+            acc[q][0] = vaddw_u8(acc[q][0], vget_low_u8(s0));
+            acc[q][1] = vaddw_u8(acc[q][1], vget_high_u8(s0));
+            acc[q][2] = vaddw_u8(acc[q][2], vget_low_u8(s1));
+            acc[q][3] = vaddw_u8(acc[q][3], vget_high_u8(s1));
         }
     }
 }
@@ -892,11 +2297,10 @@ unsafe fn score_4query_block_neon(
     vec_scales: &[f32],
     base_vec: usize,
     n_vectors: usize,
-    rows: [*mut f32; 4],
+    out: &mut [[f32; BLOCK]; 4],
 ) {
     use std::arch::aarch64::*;
 
-    let mask = vdupq_n_u8(0x0F);
     let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
 
     // Float accumulators on stack, seeded with each query's decode bias so
@@ -911,83 +2315,1167 @@ unsafe fn score_4query_block_neon(
 
     let codes_base = blocked_codes.as_ptr().add(block_offset);
 
-    for batch in 0..n_batches {
-        let g_start = batch * FLUSH_EVERY;
-        let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
-
+    if n_batches == 1 {
+        // H41. At 2 bits `n_byte_groups` is 192 against `FLUSH_EVERY`'s 256,
+        // so there is exactly one batch and `fa` has nothing to accumulate
+        // across — yet written as a loop it is 32 float values the allocator
+        // must carry through a body that already wants ~22 registers, on a
+        // file of 32. Here the scan runs with the u16 accumulators alone and
+        // `fa` is *produced* by the flush rather than updated by it.
+        //
+        // Same arithmetic, so scores stay bit-identical: the general path
+        // seeds `fa` with the bias and adds `v_scale * acc`, and this one
+        // makes the bias the fma's addend — one `vfmaq_f32` either way, with
+        // the same operands in the same order.
         let mut acc: [[uint16x8_t; 4]; 4] = [[vdupq_n_u16(0); 4]; 4];
-
-        for g in g_start..g_end {
-            // Load codes ONCE
-            let cp = codes_base.add(g * BLOCK);
-            let c0 = vld1q_u8(cp);
-            let c1 = vld1q_u8(cp.add(16));
-
-            // Split nibbles ONCE
-            let lo0 = vandq_u8(c0, mask);
-            let lo1 = vandq_u8(c1, mask);
-            let hi0 = vshrq_n_u8(c0, 4);
-            let hi1 = vshrq_n_u8(c1, 4);
-
-            // Score 4 queries against the same nibbles
-            for q in 0..4 {
-                let lp = luts[q].as_ptr().add(g * 32);
-                let lut_hi = vld1q_u8(lp);
-                let lut_lo = vld1q_u8(lp.add(16));
-                let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, lo0), vqtbl1q_u8(lut_hi, hi0));
-                let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, lo1), vqtbl1q_u8(lut_hi, hi1));
-                acc[q][0] = vaddw_u8(acc[q][0], vget_low_u8(s0));
-                acc[q][1] = vaddw_u8(acc[q][1], vget_high_u8(s0));
-                acc[q][2] = vaddw_u8(acc[q][2], vget_low_u8(s1));
-                acc[q][3] = vaddw_u8(acc[q][3], vget_high_u8(s1));
-            }
-        }
-
-        // Flush each query (bias applied once below, after all batches)
+        scan_groups_neon(codes_base, luts, 0, n_byte_groups, &mut acc);
         for q in 0..4 {
             let v_scale = vdupq_n_f32(scales[q]);
+            let v_bias = vdupq_n_f32(biases[q]);
             for i in 0..4 {
                 let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(acc[q][i])));
                 let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(acc[q][i])));
-                fa[q][i * 2] = vfmaq_f32(fa[q][i * 2], v_scale, lo);
-                fa[q][i * 2 + 1] = vfmaq_f32(fa[q][i * 2 + 1], v_scale, hi);
+                fa[q][i * 2] = vfmaq_f32(v_bias, v_scale, lo);
+                fa[q][i * 2 + 1] = vfmaq_f32(v_bias, v_scale, hi);
+            }
+        }
+    } else {
+        for batch in 0..n_batches {
+            let g_start = batch * FLUSH_EVERY;
+            let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
+
+            let mut acc: [[uint16x8_t; 4]; 4] = [[vdupq_n_u16(0); 4]; 4];
+            scan_groups_neon(codes_base, luts, g_start, g_end, &mut acc);
+
+            // Flush each query (bias applied once below, after all batches)
+            for q in 0..4 {
+                let v_scale = vdupq_n_f32(scales[q]);
+                for i in 0..4 {
+                    let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(acc[q][i])));
+                    let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(acc[q][i])));
+                    fa[q][i * 2] = vfmaq_f32(fa[q][i * 2], v_scale, lo);
+                    fa[q][i * 2 + 1] = vfmaq_f32(fa[q][i * 2 + 1], v_scale, hi);
+                }
             }
         }
     }
 
-    // Write with vec_scales
+    // Write with vec_scales; padding lanes get NEG_INFINITY so callers can
+    // take a whole-block max without seeing garbage.
     let end = (base_vec + BLOCK).min(n_vectors);
     let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
     for q in 0..4 {
-        let rp = rows[q].add(base_vec);
+        let op = out[q].as_mut_ptr();
         if end - base_vec == BLOCK {
             for i in 0..8 {
                 let n = vld1q_f32(vec_scales_ptr.add(i * 4));
-                vst1q_f32(rp.add(i * 4), vmulq_f32(fa[q][i], n));
+                vst1q_f32(op.add(i * 4), vmulq_f32(fa[q][i], n));
             }
         } else {
             let mut buf = [0.0f32; BLOCK];
             for i in 0..8 {
                 vst1q_f32(buf.as_mut_ptr().add(i * 4), fa[q][i]);
             }
-            for lane in 0..(end - base_vec) {
-                *rp.add(lane) = buf[lane] * *vec_scales_ptr.add(lane);
+            for lane in 0..BLOCK {
+                *op.add(lane) = if lane < end - base_vec {
+                    buf[lane] * *vec_scales_ptr.add(lane)
+                } else {
+                    f32::NEG_INFINITY
+                };
             }
         }
     }
 }
 
-/// Per-query nibble LUTs for NEON scoring (works for 2-bit and 4-bit).
-
-struct QueryNeonLut {
-    uint8_luts: Vec<u8>,  // n_byte_groups * 32 bytes: [hi_16 | lo_16] per group
-    scale: f32,
-    /// Total decode bias = sum of per-sub-table mins. Added once to
-    /// the accumulator at the end of scoring, not per lookup.
-    bias: f32,
+/// `SDOT` by element: `acc.4s += sum of four s8 x s8 products per 32-bit
+/// lane`, taking the second operand from one 4-byte group of `b` selected by
+/// a compile-time index.
+///
+/// Lets a single register carry two byte-group quads' worth of query
+/// weights instead of one quad needing two broadcast registers — halving
+/// both the weight registers live in the loop and the instructions that
+/// fill them. `IDX` is an assembler immediate, hence the const parameter.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot_lane<const IDX: i32>(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut o = acc;
+    std::arch::asm!(
+        ".arch_extension dotprod",
+        "sdot {o:v}.4s, {a:v}.16b, {b:v}.4b[{idx}]",
+        o = inout(vreg) o,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        idx = const IDX,
+        options(pure, nomem, nostack),
+    );
+    o
 }
 
+/// One `SMMLA`: a 2x8 by 8x2 signed int8 matrix product accumulated into a
+/// 2x2 i32 tile. 32 MACs per instruction against `SDOT`'s 16.
+///
+/// `a` is the 2x8 operand row-major — bytes 0..8 are row 0, 8..16 row 1.
+/// `b` is the 8x2 operand *column*-major — bytes 0..8 are column 0. The
+/// destination is the 2x2 product row-major: lane 0 = row0.col0, lane 1 =
+/// row0.col1, lane 2 = row1.col0, lane 3 = row1.col1.
+///
+/// Inline asm for the same reason as [`sdot`] — `vmmlaq_s32` is unstable —
+/// plus `.arch_extension i8mm`, which is an optional v8.6 feature and so
+/// must be runtime-detected by the caller ([`have_i8mm`]).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn smmla(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut o = acc;
+    std::arch::asm!(
+        ".arch_extension i8mm",
+        "smmla {o:v}.4s, {a:v}.16b, {b:v}.16b",
+        o = inout(vreg) o,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack),
+    );
+    o
+}
+
+/// Layout-facing i8mm probe, callable from any arch so [`crate::pack`] can
+/// ask without `cfg` gymnastics. Always false off aarch64.
+pub(crate) fn have_i8mm_layout() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        have_i8mm()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// Whether this core has the i8mm extension, cached after the first probe.
+///
+/// `TURBOVEC_NO_I8MM` forces the `SDOT` kernel instead, which lets the two
+/// be A/B'd from a single binary — the same escape hatch [`crate::pack`]
+/// gives the vector-major layout, and for the same reason: swapping builds
+/// between arms measures the compiler alongside the kernel.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn have_i8mm() -> bool {
+    static I8MM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *I8MM.get_or_init(|| {
+        std::env::var_os("TURBOVEC_NO_I8MM").is_none()
+            && std::arch::is_aarch64_feature_detected!("i8mm")
+    })
+}
+
+/// Reshape a batch's query weights into `SMMLA` A-operands, once per tile.
+///
+/// Each 16-byte entry is one query *pair* over one byte-group quad: bytes
+/// 0..8 are the even query's eight dimensions `8*q4 .. 8*q4+8` in dimension
+/// order, bytes 8..16 the odd query's. That is exactly the 2x8 row-major
+/// operand, so the inner loop loads it with a single `LDR` instead of
+/// rebuilding it 4x per block (once per quarter) from the interleaved
+/// [`QueryPermuteDot::weights`] layout.
+///
+/// Indexed quad-major so the pairs a single `q4` iteration wants are
+/// contiguous. Costs `NQ * dim` bytes of shuffling per tile and is reused
+/// across every block in that tile.
+#[cfg(target_arch = "aarch64")]
+fn build_smmla_a<const NQ: usize>(pds: &[&QueryPermuteDot; NQ], quads: usize) -> Vec<i8> {
+    let pairs = NQ / 2;
+    let mut a = vec![0i8; quads * pairs * 16];
+    for q4 in 0..quads {
+        for p in 0..pairs {
+            let dst = (q4 * pairs + p) * 16;
+            for (r, pd) in pds[2 * p..2 * p + 2].iter().enumerate() {
+                let w = &pd.weights[q4 * 8..q4 * 8 + 8];
+                for j in 0..4 {
+                    // weights holds [4 lo][4 hi] per quad, and the high
+                    // nibble is the *even* dimension, so dimension order
+                    // within the quad is hi(0), lo(0), hi(1), lo(1), ...
+                    a[dst + r * 8 + 2 * j] = w[4 + j];
+                    a[dst + r * 8 + 2 * j + 1] = w[j];
+                }
+            }
+        }
+    }
+    a
+}
+
+/// `SMMLA` A-operands for the `vm8` layout, once per tile.
+///
+/// `vm8` makes the TBL output the B operand directly, but the dimensions it
+/// carries are the eight *even* ones of a byte-group run (from the high
+/// nibbles) or the eight *odd* ones (low nibbles) — not eight consecutive.
+/// `SMMLA` sums over whatever pairing A and B agree on, so the fix is to
+/// build A in that same order rather than to reorder B, which is the whole
+/// point: the ZIPs go away.
+///
+/// Entry `(q8 * pairs + p) * 32` holds the even-dim operand for query pair
+/// `p` over byte-groups `8*q8 .. 8*q8+8` in its first 16 bytes and the
+/// odd-dim operand in its second 16.
+#[cfg(target_arch = "aarch64")]
+fn build_smmla_a_vm8<const NQ: usize>(pds: &[&QueryPermuteDot; NQ], octs: usize) -> Vec<i8> {
+    let pairs = NQ / 2;
+    let mut a = vec![0i8; octs * pairs * 32];
+    for q8 in 0..octs {
+        for p in 0..pairs {
+            let dst = (q8 * pairs + p) * 32;
+            for (r, pd) in pds[2 * p..2 * p + 2].iter().enumerate() {
+                for j in 0..8 {
+                    // Byte-group 8*q8+j lives in quad (8*q8+j)/4 at slot
+                    // (8*q8+j)%4 of `weights`, which stores [4 lo][4 hi].
+                    let g = 8 * q8 + j;
+                    let (q4, slot) = (g / 4, g % 4);
+                    // High nibble is the even dim, low the odd.
+                    a[dst + r * 8 + j] = pd.weights[q4 * 8 + 4 + slot];
+                    a[dst + 16 + r * 8 + j] = pd.weights[q4 * 8 + slot];
+                }
+            }
+        }
+    }
+    a
+}
+
+/// One-query `vm8` scan, whole block, 16 accumulators live.
+///
+/// A lone query rides SMMLA as a duplicated pair — lanes 2/3 of every tile
+/// repeat lanes 0/1 — so half the MACs are thrown away. That waste is not
+/// what costs: the batched kernel and this one issue the same instructions
+/// per byte of codes.
+///
+/// What costs is **instruction-level parallelism**. SMMLA has latency 3 and
+/// needs several independent accumulator chains to stay fed. The batched
+/// kernel holds 16 (4 query pairs x 4 vector pairs) and saturates; routing
+/// one query through it at `NQ=2, NP=1` leaves **two**, and the loop goes
+/// latency-bound. Measured: 6.19 ms against the classic LUT kernel's 4.15 at
+/// nq=1, despite an identical instruction count. See H42.
+///
+/// With a single query pair the register budget is nearly empty, so this
+/// keeps a separate accumulator for all 16 vector pairs of the block —
+/// 16 chains, the same ILP the batched kernel gets, and 18 of 32 registers.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_block_vm8_single(
+    blocked_codes: &[u8],
+    pd: &QueryPermuteDot,
+    a_buf: &[i8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [[f32; BLOCK]; 1],
+) {
+    use std::arch::aarch64::*;
+
+    let mask = vdupq_n_u8(0x0F);
+    let levels = vld1q_s8(pd.levels.as_ptr());
+    let octs = n_byte_groups / 8;
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+    let a_base = a_buf.as_ptr();
+
+    // acc[r] covers block lanes 2r, 2r+1 — the whole block, so every chain
+    // is independent for the entire scan.
+    let mut acc = [vdupq_n_s32(0); 16];
+    for q8 in 0..octs {
+        let ap = a_base.add(q8 * 32);
+        let ae = vld1q_s8(ap);
+        let ao = vld1q_s8(ap.add(16));
+        // Four loads in flight, not sixteen. All 16 accumulators stay live
+        // — H44 showed eight chains stall, since SMMLA is latency 3 on four
+        // pipes and wants ~12 — but LLVM was hoisting all sixteen code
+        // loads alongside them and spilling (13 `stp` per loop). Consuming
+        // each group of four before the next is loaded caps the transient
+        // pressure at 16 + 4 rather than 16 + 16. See H45.
+        for g in 0..4 {
+            let mut cs = [vdupq_n_u8(0); 4];
+            for (j, c) in cs.iter_mut().enumerate() {
+                *c = vld1q_u8(codes_base.add(q8 * 256 + (g * 4 + j) * 16));
+            }
+            for (j, &c) in cs.iter().enumerate() {
+                let r = g * 4 + j;
+                let bo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+                let be = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+                acc[r] = smmla(acc[r], ae, be);
+                acc[r] = smmla(acc[r], ao, bo);
+            }
+        }
+    }
+
+    // A operand is the query duplicated, so lane 0 is this query against
+    // vector 2r and lane 1 against 2r+1; lanes 2/3 repeat them.
+    let vs = vdupq_n_f32(pd.scale);
+    let vb = vdupq_n_f32(pd.bias);
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    let mut raw = [0.0f32; BLOCK];
+    for i in 0..8 {
+        let t = vcombine_s32(vget_low_s32(acc[i * 2]), vget_low_s32(acc[i * 2 + 1]));
+        vst1q_f32(raw.as_mut_ptr().add(i * 4), vfmaq_f32(vb, vcvtq_f32_s32(t), vs));
+    }
+    let op = out[0].as_mut_ptr();
+    if end - base_vec == BLOCK {
+        for i in 0..8 {
+            let f = vld1q_f32(raw.as_ptr().add(i * 4));
+            let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+            vst1q_f32(op.add(i * 4), vmulq_f32(f, n));
+        }
+    } else {
+        for lane in 0..BLOCK {
+            *op.add(lane) = if lane < end - base_vec {
+                raw[lane] * *vec_scales_ptr.add(lane)
+            } else {
+                f32::NEG_INFINITY
+            };
+        }
+    }
+}
+
+/// `SMMLA` scan of one 32-vector block over the **`vm8`** layout — the
+/// ZIP-free variant (H41).
+///
+/// Identical arithmetic to [`score_block_permute_smmla_neon`], two fewer
+/// instructions per code register. `vm8` puts two vectors x eight
+/// byte-groups in each 16-byte register, so after the nibble split the TBL
+/// output *is* an `SMMLA` B operand: bytes 0-7 are vector `2r`'s eight even
+/// dimensions and 8-15 are vector `2r+1`'s. No reorder, because the operand
+/// arrived in operand shape.
+///
+/// The dimensions are the even eight (high nibbles) and the odd eight (low
+/// nibbles) rather than eight consecutive; `build_smmla_a_vm8` builds A to
+/// match. P23 priced the two ZIPs at x1.12.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_block_smmla_vm8<const NQ: usize, const NP: usize>(
+    blocked_codes: &[u8],
+    pds: &[&QueryPermuteDot; NQ],
+    a_buf: &[i8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [[f32; BLOCK]; NQ],
+) {
+    use std::arch::aarch64::*;
+    const { assert!(NQ == 2 * NP, "SMMLA tiles queries in pairs") };
+
+    let pairs = NP;
+    let mask = vdupq_n_u8(0x0F);
+    let levels = vld1q_s8(pds[0].levels.as_ptr());
+    let octs = n_byte_groups / 8;
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+    let a_base = a_buf.as_ptr();
+
+    let mut raw = [[0.0f32; BLOCK]; NQ];
+    // Eighth-blocks, not quarters. `vm8` needs *two* A operands per query
+    // pair — the even-dim and odd-dim halves — where the 4-group kernel
+    // needed one, so at NQ=8 the A registers go from 4 to 8. Quarter-blocks
+    // would hold 16 accumulators on top of that and spill: the first cut of
+    // this kernel did exactly that, and `objdump` showed two accumulators
+    // going to the stack every iteration, which ate the win the ZIPs paid
+    // for. Four lanes per part halves the accumulators to 8, and 8 + 8 plus
+    // the level table, mask and three transients fits. See H41.
+    for part in 0..8 {
+        // acc[p][r]: query pair `p` against the vector pair in register
+        // `part*2 + r`, i.e. block lanes `part*4 + r*2` and `+1`.
+        let mut acc = [[vdupq_n_s32(0); 2]; NP];
+
+        for q8 in 0..octs {
+            let ap = a_base.add(q8 * pairs * 32);
+            let mut ae = [vdupq_n_s8(0); NP];
+            let mut ao = [vdupq_n_s8(0); NP];
+            for p in 0..pairs {
+                ae[p] = vld1q_s8(ap.add(p * 32));
+                ao[p] = vld1q_s8(ap.add(p * 32 + 16));
+            }
+            // Deep prefetch for the batched (nq=100) pattern. H48 refuted
+            // arm prefetch at **nq=1 only**, and P29 closed nq=100 on a
+            // compute-bound reading that P35 has since undercut: the PMU
+            // attributes 18.4% of nq=100 cycles to memory stalls. H62 showed
+            // a 32-unit lookahead is worth +25% on x86's 12.5-sweep pattern,
+            // which arm nq=100 shares. See H67.
+            {
+                let pf = q8 * 256 + 32 * 256;
+                if block_offset + pf + 64 <= blocked_codes.len() {
+                    std::arch::asm!(
+                        "prfm pldl1keep, [{p}]",
+                        p = in(reg) codes_base.add(pf),
+                        options(nostack, readonly, preserves_flags),
+                    );
+                }
+            }
+            for r in 0..2 {
+                let c = vld1q_u8(codes_base.add(q8 * 256 + (part * 2 + r) * 16));
+                // Already B operands: no ZIP.
+                let bo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+                let be = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+                for p in 0..pairs {
+                    acc[p][r] = smmla(acc[p][r], ae[p], be);
+                    acc[p][r] = smmla(acc[p][r], ao[p], bo);
+                }
+            }
+        }
+
+        // Same 2x2 scatter as the classic kernel: lanes 0/1 of a tile belong
+        // to the even query of the pair, 2/3 to the odd.
+        for p in 0..pairs {
+            for (r, q) in [2 * p, 2 * p + 1].into_iter().enumerate() {
+                let vs = vdupq_n_f32(pds[q].scale);
+                let vb = vdupq_n_f32(pds[q].bias);
+                let (x, y) = (acc[p][0], acc[p][1]);
+                let t = if r == 0 {
+                    vcombine_s32(vget_low_s32(x), vget_low_s32(y))
+                } else {
+                    vcombine_s32(vget_high_s32(x), vget_high_s32(y))
+                };
+                let f = vfmaq_f32(vb, vcvtq_f32_s32(t), vs);
+                vst1q_f32(raw[q].as_mut_ptr().add(part * 4), f);
+            }
+        }
+    }
+
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    for q in 0..NQ {
+        let op = out[q].as_mut_ptr();
+        if end - base_vec == BLOCK {
+            for i in 0..8 {
+                let f = vld1q_f32(raw[q].as_ptr().add(i * 4));
+                let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+                vst1q_f32(op.add(i * 4), vmulq_f32(f, n));
+            }
+        } else {
+            for lane in 0..BLOCK {
+                *op.add(lane) = if lane < end - base_vec {
+                    raw[q][lane] * *vec_scales_ptr.add(lane)
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
+        }
+    }
+}
+
+/// Permute-dot scan of one 32-vector block using `SMMLA`, for `NQ` queries
+/// at once (4-bit codes, `NQ` even).
+///
+/// The i8mm half of the permute-dot family (H33). Everything up to the two
+/// TBLs is shared with [`score_block_permute_dot_neon`]; the difference is
+/// what consumes them. `SDOT` reduces four products into one lane, so it
+/// takes one query against four vectors. `SMMLA` reduces eight, arranged as
+/// a 2x2 outer tile, so it takes *two* queries against *two* vectors —
+/// twice the MACs for the same issue slot.
+///
+/// The unpacked nibbles fall into the 8x2 operand for free. `vlo`/`vhi`
+/// byte `4u+v` is vector `4k+u`'s dimension `8*q4 + 2v+1` / `2v`, so
+/// `vzip1q_s8(vhi, vlo)` lays vectors `4k` and `4k+1` down as eight
+/// consecutive dimensions each — column-major, which is what `SMMLA`
+/// wants — and `vzip2q_s8` does the same for `4k+2` and `4k+3`. Two extra
+/// ZIPs per code register buy 8 SMMLA in place of 16 SDOT at NQ=8.
+///
+/// Register budget on a quarter-block at NQ=8: 16 accumulators (4 query
+/// pairs x 4 vector pairs), 4 A-operands, the level table and mask, and
+/// five transients — about 26 of 32. That ceiling is what sank H29 and
+/// shaped H30/H32, so it is checked before the kernel, not after.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_block_permute_smmla_neon<const NQ: usize, const NP: usize>(
+    blocked_codes: &[u8],
+    pds: &[&QueryPermuteDot; NQ],
+    a_buf: &[i8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [[f32; BLOCK]; NQ],
+) {
+    use std::arch::aarch64::*;
+    // `NP` is `NQ / 2` spelled out: Rust will not let a const generic be
+    // divided in an array length, and the accumulator tile must stay a
+    // compile-time constant or it lands on the stack instead of in
+    // registers.
+    const { assert!(NQ == 2 * NP, "SMMLA tiles queries in pairs") };
+
+    let pairs = NP;
+    let mask = vdupq_n_u8(0x0F);
+    let levels = vld1q_s8(pds[0].levels.as_ptr());
+    let quads = n_byte_groups / 4;
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+    let a_base = a_buf.as_ptr();
+
+    let mut raw = [[0.0f32; BLOCK]; NQ];
+    for part in 0..4 {
+        // acc[p][w]: query pair `p` against vector pair `w`, where `w`
+        // covers block lanes `part*8 + w*2` and `+1`.
+        let mut acc = [[vdupq_n_s32(0); 4]; NP];
+
+        for q4 in 0..quads {
+            let ap = a_base.add(q4 * pairs * 16);
+            let mut a = [vdupq_n_s8(0); NP];
+            for (p, aq) in a.iter_mut().enumerate() {
+                *aq = vld1q_s8(ap.add(p * 16));
+            }
+            for i in 0..2 {
+                let c = vld1q_u8(codes_base.add(q4 * 128 + (part * 2 + i) * 16));
+                let vlo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+                let vhi = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+                // Dimension-ordered columns: vectors 4k,4k+1 then 4k+2,4k+3.
+                let b0 = vzip1q_s8(vhi, vlo);
+                let b1 = vzip2q_s8(vhi, vlo);
+                for p in 0..pairs {
+                    acc[p][i * 2] = smmla(acc[p][i * 2], a[p], b0);
+                    acc[p][i * 2 + 1] = smmla(acc[p][i * 2 + 1], a[p], b1);
+                }
+            }
+        }
+
+        // Scatter the 2x2 tiles. Lanes 0/1 of a tile belong to the even
+        // query of the pair and lanes 2/3 to the odd one, so pulling the
+        // low halves of two adjacent tiles together rebuilds four
+        // consecutive block lanes for one query.
+        for p in 0..pairs {
+            for (r, q) in [2 * p, 2 * p + 1].into_iter().enumerate() {
+                let vs = vdupq_n_f32(pds[q].scale);
+                let vb = vdupq_n_f32(pds[q].bias);
+                for h in 0..2 {
+                    let (x, y) = (acc[p][h * 2], acc[p][h * 2 + 1]);
+                    let t = if r == 0 {
+                        vcombine_s32(vget_low_s32(x), vget_low_s32(y))
+                    } else {
+                        vcombine_s32(vget_high_s32(x), vget_high_s32(y))
+                    };
+                    let f = vfmaq_f32(vb, vcvtq_f32_s32(t), vs);
+                    vst1q_f32(raw[q].as_mut_ptr().add(part * 8 + h * 4), f);
+                }
+            }
+        }
+    }
+
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    for q in 0..NQ {
+        let op = out[q].as_mut_ptr();
+        if end - base_vec == BLOCK {
+            for i in 0..8 {
+                let f = vld1q_f32(raw[q].as_ptr().add(i * 4));
+                let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+                vst1q_f32(op.add(i * 4), vmulq_f32(f, n));
+            }
+        } else {
+            for lane in 0..BLOCK {
+                *op.add(lane) = if lane < end - base_vec {
+                    raw[q][lane] * *vec_scales_ptr.add(lane)
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
+        }
+    }
+}
+
+/// Permute-dot scan of one 32-vector block over the vector-major layout,
+/// for `NQ` queries at once (4-bit codes).
+///
+/// The ARM half of P18. `SDOT` reduces four s8 x s8 products into one 32-bit
+/// lane, exactly as `vpdpbusd` does on x86 — and it is signed by signed, so
+/// unlike x86 it needs no `+128` bias on the level table and no `zero`
+/// correction. The integers accumulated are identical on both arches.
+///
+/// The vector-major unit puts each vector's four consecutive byte-groups in
+/// its own aligned 4-byte group, so one 16-byte register holds four vectors
+/// and one `SDOT` advances all four by four dimensions. Register `i` covers
+/// lanes `i*4 .. i*4+3`, matching the float accumulator order the classic
+/// NEON kernel writes, so the epilogue and every caller are unchanged.
+///
+/// No flush: the widest possible sum over 768 dimensions is `768 * 127 *
+/// 127` ~ 1.2e7, well inside i32, so the `FLUSH_EVERY` cadence and the u8
+/// pre-add that capped the LUT at 127 both leave this path.
+/// H72: 2-bit codes in the `vm8` layout scored with `SMMLA`.
+///
+/// A 16-byte load is two vectors x eight byte-groups; each byte holds four
+/// 2-bit codes (bits 7:6 = dim 4g, 5:4 = 4g+1, 3:2 = 4g+2, 1:0 = 4g+3). Two
+/// 16-entry tables turn the masked low nibble and the shifted high nibble
+/// into the four level registers, and each level register is already an
+/// `SMMLA` B operand: bytes 0-7 are vector 0's dims `4g + k` over the octet,
+/// bytes 8-15 vector 1's. The A operands (`build_smmla_a_vm8_2bit`) are the
+/// query pairs' weights in that same dimension order, so no ZIP is needed.
+///
+/// Scores are `bias + scale * i32` with the query rounded to i8 per
+/// dimension and the codebook to i8 — not bit-identical to the LUT path.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_block_smmla_vm8_2bit<const NQ: usize, const NP: usize>(
+    blocked_codes: &[u8],
+    pds: &[&QueryPermuteDot; NQ],
+    a_buf: &[i8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [[f32; BLOCK]; NQ],
+) {
+    use std::arch::aarch64::*;
+    const { assert!(NQ == 2 * NP, "SMMLA tiles queries in pairs") };
+
+    let pairs = NP;
+    let mask = vdupq_n_u8(0x0F);
+    let ta = vld1q_s8(pds[0].levels.as_ptr());
+    let tb = vld1q_s8(pds[0].levels2.as_ptr());
+    let octs = n_byte_groups / 8;
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+    let a_base = a_buf.as_ptr();
+
+    let mut raw = [[0.0f32; BLOCK]; NQ];
+    for part in 0..8 {
+        let mut acc = [[vdupq_n_s32(0); 2]; NP];
+        for q8 in 0..octs {
+            let ap = a_base.add(q8 * pairs * 64);
+            for r in 0..2 {
+                let c = vld1q_u8(codes_base.add(q8 * 256 + (part * 2 + r) * 16));
+                let lo = vandq_u8(c, mask);
+                let hi = vshrq_n_u8(c, 4);
+                // Stored byte order is big-endian in dimensions: bits 7:6 =
+                // dim 4g, 5:4 = 4g+1, 3:2 = 4g+2, 1:0 = 4g+3 (see
+                // `pack::build_extract_lut`), so the high nibble carries the
+                // first two dims and the low nibble the last two.
+                let f0 = vqtbl1q_s8(tb, hi);
+                let f1 = vqtbl1q_s8(ta, hi);
+                let f2 = vqtbl1q_s8(tb, lo);
+                let f3 = vqtbl1q_s8(ta, lo);
+                for p in 0..pairs {
+                    let a = ap.add(p * 64);
+                    acc[p][r] = smmla(acc[p][r], vld1q_s8(a), f0);
+                    acc[p][r] = smmla(acc[p][r], vld1q_s8(a.add(16)), f1);
+                    acc[p][r] = smmla(acc[p][r], vld1q_s8(a.add(32)), f2);
+                    acc[p][r] = smmla(acc[p][r], vld1q_s8(a.add(48)), f3);
+                }
+            }
+        }
+        for p in 0..pairs {
+            for (r, q) in [2 * p, 2 * p + 1].into_iter().enumerate() {
+                let vs = vdupq_n_f32(pds[q].scale);
+                let vb = vdupq_n_f32(pds[q].bias);
+                let (x, y) = (acc[p][0], acc[p][1]);
+                let t = if r == 0 {
+                    vcombine_s32(vget_low_s32(x), vget_low_s32(y))
+                } else {
+                    vcombine_s32(vget_high_s32(x), vget_high_s32(y))
+                };
+                let f = vfmaq_f32(vb, vcvtq_f32_s32(t), vs);
+                vst1q_f32(raw[q].as_mut_ptr().add(part * 4), f);
+            }
+        }
+    }
+
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    for q in 0..NQ {
+        let op = out[q].as_mut_ptr();
+        if end - base_vec == BLOCK {
+            for i in 0..8 {
+                let f = vld1q_f32(raw[q].as_ptr().add(i * 4));
+                let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+                vst1q_f32(op.add(i * 4), vmulq_f32(f, n));
+            }
+        } else {
+            for lane in 0..BLOCK {
+                *op.add(lane) = if lane < end - base_vec {
+                    raw[q][lane] * *vec_scales_ptr.add(lane)
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_block_permute_dot_neon<const NQ: usize>(
+    blocked_codes: &[u8],
+    pds: &[&QueryPermuteDot; NQ],
+    block_offset: usize,
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [[f32; BLOCK]; NQ],
+) {
+    use std::arch::aarch64::*;
+
+    let mask = vdupq_n_u8(0x0F);
+    // One shared nibble -> level permute for every query and every
+    // dimension, live in a register for the whole block.
+    let levels = vld1q_s8(pds[0].levels.as_ptr());
+    let quads = n_byte_groups / 4;
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+
+    // The block is scored in quarters, 8 vectors at a time.
+    //
+    // A whole block needs 8 accumulator registers per query, which at 4
+    // queries is 32 — the entire NEON register file, before the level table,
+    // the mask, the code register, the two TBL results and 8 weight
+    // registers. That spills, and the spills cost more than the fused batch
+    // saves: the kernel measured 1.60 SDOT/cycle against a 3.11/cycle
+    // independent-issue ceiling. Half a block is 4 accumulators per query,
+    // 16 at NQ=4, which leaves room for the rest of the working set.
+    //
+    // The two halves read disjoint 64-byte runs of each 128-byte
+    // vector-major unit, so each byte of the block is still read exactly
+    // once across the pair. See LOG_search.md H30.
+    let mut raw = [[0.0f32; BLOCK]; NQ];
+    for part in 0..4 {
+        // acc[q][i]: four vectors per register, covering block lanes
+        // (half*4 + i)*4 .. +4.
+        let mut acc = [[vdupq_n_s32(0); 2]; NQ];
+
+        // Two byte-group quads per iteration: their weights are 16
+        // contiguous bytes, so one register per query holds all four 4-byte
+        // groups and `SDOT` selects between them by index. That is 4 weight
+        // registers at NQ=4 instead of 8, and one load instead of four.
+        // Lane order within the register follows `weights`: lo(q4),
+        // hi(q4), lo(q4+1), hi(q4+1).
+        let mut q4 = 0usize;
+        while q4 < quads {
+            let paired = q4 + 1 < quads;
+            let mut w = [vdupq_n_s8(0); NQ];
+            for (wq, pd) in w.iter_mut().zip(pds.iter()) {
+                let wp = pd.weights.as_ptr().add(q4 * 8);
+                *wq = if paired {
+                    vld1q_s8(wp)
+                } else {
+                    // Odd final quad: only its own 8 bytes exist, and lanes
+                    // 2/3 are never indexed below.
+                    vcombine_s8(vld1_s8(wp), vdup_n_s8(0))
+                };
+            }
+            for i in 0..2 {
+                let c = vld1q_u8(codes_base.add(q4 * 128 + (part * 2 + i) * 16));
+                // Shared across the whole batch — this is the whole point.
+                let vlo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+                let vhi = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+                for q in 0..NQ {
+                    acc[q][i] = sdot_lane::<0>(acc[q][i], vlo, w[q]);
+                    acc[q][i] = sdot_lane::<1>(acc[q][i], vhi, w[q]);
+                }
+            }
+            if paired {
+                for i in 0..2 {
+                    let c = vld1q_u8(codes_base.add((q4 + 1) * 128 + (part * 2 + i) * 16));
+                    let vlo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+                    let vhi = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+                    for q in 0..NQ {
+                        acc[q][i] = sdot_lane::<2>(acc[q][i], vlo, w[q]);
+                        acc[q][i] = sdot_lane::<3>(acc[q][i], vhi, w[q]);
+                    }
+                }
+            }
+            q4 += 2;
+        }
+
+        // Convert this half out of the register file before the next one
+        // claims it. `vec_scales` and padding are applied once at the end,
+        // over both halves together.
+        for q in 0..NQ {
+            let vs = vdupq_n_f32(pds[q].scale);
+            let vb = vdupq_n_f32(pds[q].bias);
+            for i in 0..2 {
+                let f = vfmaq_f32(vb, vcvtq_f32_s32(acc[q][i]), vs);
+                vst1q_f32(raw[q].as_mut_ptr().add((part * 2 + i) * 4), f);
+            }
+        }
+    }
+
+    // Padding lanes get NEG_INFINITY so callers can take a whole-block max
+    // without seeing garbage — same contract as the classic NEON kernel.
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    for q in 0..NQ {
+        let op = out[q].as_mut_ptr();
+        if end - base_vec == BLOCK {
+            for i in 0..8 {
+                let f = vld1q_f32(raw[q].as_ptr().add(i * 4));
+                let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+                vst1q_f32(op.add(i * 4), vmulq_f32(f, n));
+            }
+        } else {
+            for lane in 0..BLOCK {
+                *op.add(lane) = if lane < end - base_vec {
+                    raw[q][lane] * *vec_scales_ptr.add(lane)
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
+        }
+    }
+}
+
+/// Fold one scored block into a query's running top-k — the ARM analogue
+/// of the x86 post-flush heap update. Insertion order is lane-ascending
+/// within block-ascending visits, so together with [`rescan_min`]'s
+/// evict-largest-index tie-break the results are identical to a flat
+/// index-order scan of a fully materialized score row.
+///
+/// `block_scores` must hold NEG_INFINITY in padding lanes (the kernels
+/// guarantee this) so the whole-block max prune can read all 32 lanes.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn neon_block_topk_update(
+    block_scores: &[f32; BLOCK],
+    base_vec: usize,
+    end_lane: usize,
+    mask: Option<&[u64]>,
+    k: usize,
+    hs: &mut [f32],
+    hi: &mut [u64],
+    sz: &mut usize,
+    hmin: &mut f32,
+    hmi: &mut usize,
+) {
+    use std::arch::aarch64::*;
+
+    if *hmi == HEAP_BUFFERED {
+        let p = block_scores.as_ptr();
+        let mut m = vld1q_f32(p);
+        for i in 1..8 {
+            m = vmaxq_f32(m, vld1q_f32(p.add(i * 4)));
+        }
+        if vmaxvq_f32(m) <= *hmin {
+            return;
+        }
+        // A large shortlist has a lane or two over the threshold in most
+        // blocks, and walking all 32 lanes behind an unpredictable branch
+        // then costs more than the block's scan. Take the lanes over the
+        // threshold as a mask (four bits a lane, the narrowing-shift
+        // idiom) and visit only those.
+        let thr = vdupq_n_f32(*hmin);
+        let allowed = block_mask_word(mask, base_vec);
+        for half in 0..2usize {
+            let q = p.add(half * 16);
+            let c = |i: usize| vmovn_u32(vcgtq_f32(vld1q_f32(q.add(i * 4)), thr));
+            let b = vcombine_u8(
+                vmovn_u16(vcombine_u16(c(0), c(1))),
+                vmovn_u16(vcombine_u16(c(2), c(3))),
+            );
+            let mut bits = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(b))))
+                & 0x1111_1111_1111_1111;
+            while bits != 0 {
+                let lane = half * 16 + (bits.trailing_zeros() / 4) as usize;
+                bits &= bits - 1;
+                let s = *p.add(lane);
+                // A compaction inside this block raises the threshold.
+                if lane < end_lane && s > *hmin && (allowed >> lane) & 1 != 0 {
+                    hs[*sz] = s;
+                    hi[*sz] = (base_vec + lane) as u64;
+                    *sz += 1;
+                    if *sz == k {
+                        *hmin = compact_half(hs, hi, k);
+                        *sz = (k / 2).max(1);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if *sz >= k {
+        // Whole-block prune: skip the lane loop when nothing can beat the
+        // current heap minimum (the overwhelmingly common case once the
+        // heap is warm).
+        let p = block_scores.as_ptr();
+        let mut m = vld1q_f32(p);
+        for i in 1..8 {
+            m = vmaxq_f32(m, vld1q_f32(p.add(i * 4)));
+        }
+        if vmaxvq_f32(m) <= *hmin {
+            return;
+        }
+    }
+    for (lane, &s) in block_scores.iter().enumerate().take(end_lane) {
+        if let Some(am) = mask {
+            if !mask_allows(am, base_vec + lane) {
+                continue;
+            }
+        }
+        if *sz < k {
+            hs[*sz] = s;
+            hi[*sz] = (base_vec + lane) as u64;
+            *sz += 1;
+            if *sz == k {
+                let (m, mi) = rescan_min(hs, hi, k);
+                *hmin = m;
+                *hmi = mi;
+            }
+        } else if s > *hmin {
+            hs[*hmi] = s;
+            hi[*hmi] = (base_vec + lane) as u64;
+            let (m, mi) = rescan_min(hs, hi, k);
+            *hmin = m;
+            *hmi = mi;
+        }
+    }
+}
+
+/// Bytes in a 64-byte-aligned allocation.
+///
+/// H118: the `vpermb` scan loads its tables 64 bytes at a time. In a plain
+/// `Vec<u8>` their alignment is whatever the allocator returned, so every
+/// table load either sits in one cache line or straddles two, per query,
+/// by luck — which showed as a 6% swing in x86 nq=1 between two builds
+/// that differed by one unrelated allocation.
+#[derive(Default)]
+pub(crate) struct AlignedBytes {
+    buf: Vec<Align64>,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Align64([u8; 64]);
+
+impl AlignedBytes {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn from_slice(bytes: &[u8]) -> Self {
+        let mut buf = vec![Align64([0u8; 64]); bytes.len().div_ceil(64)];
+        // SAFETY: `buf` owns `buf.len() * 64 >= bytes.len()` initialised
+        // bytes, and `Align64` is a plain byte array.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr() as *mut u8, bytes.len());
+        }
+        Self { buf, len: bytes.len() }
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        // SAFETY: `len <= buf.len() * 64`, all initialised (see `from_slice`).
+        unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.len) }
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Per-query nibble LUTs for NEON scoring (works for 2-bit and 4-bit).
+
+pub(crate) struct QueryNeonLut {
+    pub(crate) uint8_luts: Vec<u8>,  // n_byte_groups * 32 bytes: [hi_16 | lo_16] per group
+    /// H72: the 2-bit SMMLA operand set (aarch64, vm8 layout at 2 bits).
+    /// `None` unless this index is in that layout; the nq=1 path never reads
+    /// it, so the single-query LUT kernel is unaffected by its presence.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) pd2: Option<QueryPermuteDot>,
+    /// The same table reordered for `vpermb` (see [`split_lut_for_vnni`]).
+    /// Empty unless this process and geometry use the vector-major layout;
+    /// built once per query rather than per tile.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) split: AlignedBytes,
+    /// Present instead of `split` when this geometry can use the permute-dot
+    /// kernel (see [`QueryPermuteDot`]); the two are mutually exclusive.
+    pub(crate) pd: Option<QueryPermuteDot>,
+    pub(crate) scale: f32,
+    /// Total decode bias = sum of per-sub-table mins. Added once to
+    /// the accumulator at the end of scoring, not per lookup.
+    pub(crate) bias: f32,
+}
+
+
+/// Rearrange a query's LUT for the `vpermb` kernel.
+///
+/// `vpermb`'s index is 6 bits, so `(j << 4) | code` selects from a 64-byte
+/// table holding four consecutive 16-entry sub-tables. Per group of four
+/// byte-groups this emits 64 bytes of the four *lo*-nibble sub-tables
+/// followed by 64 bytes of the four *hi* — the same values as
+/// `uint8_luts`, reordered so one permute serves four byte-groups at once.
+///
+/// Same total size as the source, built once per query.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn split_lut_for_vnni(uint8_luts: &[u8], n_byte_groups: usize) -> Vec<u8> {
+    debug_assert_eq!(uint8_luts.len(), n_byte_groups * 32);
+    debug_assert_eq!(n_byte_groups % 4, 0);
+    let mut out = vec![0u8; n_byte_groups * 32];
+    for g0 in (0..n_byte_groups).step_by(4) {
+        let c = (g0 / 4) * 128;
+        for j in 0..4 {
+            let src = (g0 + j) * 32;
+            // `uint8_luts` is [hi_16 | lo_16] per group.
+            out[c + j * 16..c + j * 16 + 16].copy_from_slice(&uint8_luts[src + 16..src + 32]);
+            out[c + 64 + j * 16..c + 64 + j * 16 + 16]
+                .copy_from_slice(&uint8_luts[src..src + 16]);
+        }
+    }
+    out
+}
+
+/// Per-query state for the permute-dot kernel.
+///
+/// The codebook is shared across every dimension, so nibble -> level is a
+/// *fixed* 16-entry permute: query-independent, dimension-independent, and
+/// register-resident for the whole scan. Applying it to nibbles that have to
+/// be unpacked anyway turns the score into a plain integer dot product,
+///
+///   score = Σ_d q[d] * C[code[d]]
+///
+/// which is what `vpdpbusd` computes natively — with the full Lloyd-Max
+/// codebook intact. That last part is what separates this from the uniform
+/// codebook of P15/P17, which bought the same dot product at ~2 recall
+/// points. Here recall goes *up*, because the query and the codebook are
+/// quantized separately to 8 bits and their products accumulate exactly in
+/// i32, rather than each (dimension, level) product being pre-rounded into a
+/// 7-bit table entry.
+///
+/// Only built for 4-bit codes: at 2 bits a nibble spans two dimensions, so
+/// its value depends on two query weights and the map stops being shared.
+///
+/// Shared by both arches. `vpdpbusd` and `SDOT` reduce four bytes into one
+/// 32-bit lane in the same way, so the layout and the arithmetic are common.
+/// The only difference is that `vpdpbusd` multiplies *unsigned* by signed and
+/// needs the level table biased into u8 range, which `zero` then cancels
+/// exactly; `SDOT` is signed by signed and takes the table as-is. Both
+/// therefore accumulate the same integers and produce bit-identical scores.
+///
+/// See P18 in `benchmarks/hillclimb/LOG_search.md`.
+pub(crate) struct QueryPermuteDot {
+    /// The codebook as int8. x86 biases this by +128 in-register to feed
+    /// `vpdpbusd`'s unsigned operand; `SDOT` reads it directly.
+    pub(crate) levels: [i8; 16],
+    /// H72: at 2 bits a byte holds four codes and two 16-entry tables serve
+    /// them: `levels[i] = level[i & 3]` for the fields at bits 1:0 / 5:4 and
+    /// `levels2[i] = level[(i >> 2) & 3]` for the fields at bits 3:2 / 7:6,
+    /// indexed by the masked low nibble and the shifted high nibble.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) levels2: [i8; 16],
+    /// One int8 weight per dimension, grouped to match the 4-byte reduction:
+    /// bytes `q4*8 .. q4*8+4` hold the *low*-nibble dimensions of byte-groups
+    /// `4*q4 .. 4*q4+4`, and bytes `q4*8+4 .. q4*8+8` the high-nibble ones —
+    /// the same four byte-groups one instruction sums into a single vector's
+    /// 32-bit lane.
+    ///
+    /// Note the packing order: [`crate::pack`] writes code `c` of a group at
+    /// shift `(codes_per_byte - 1 - c) * bits`, so at 4 bits the *high*
+    /// nibble carries the even dimension `2g` and the low nibble the odd
+    /// `2g+1` — the reverse of the reading the field names suggest.
+    pub(crate) weights: Vec<i8>,
+    /// Accumulator seed for kernels that bias `levels` into unsigned range:
+    /// `-128 * Σ_d w[d]`, which cancels that bias exactly. Seeding the
+    /// accumulator rather than correcting afterwards keeps the cancellation
+    /// in exact integers and costs nothing — the large offset never reaches
+    /// the f32 conversion, where it would cost precision once the raw sum
+    /// passed 2^24. Unused by `SDOT`, which needs no bias.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) zero: i32,
+    pub(crate) scale: f32,
+    pub(crate) bias: f32,
+}
+
+/// Quantize one query row and the shared codebook to int8 for
+/// [`QueryPermuteDot`].
+fn build_permute_dot(q_rot_row: &[f32], centroids: &[f32], dim: usize) -> QueryPermuteDot {
+    debug_assert_eq!(centroids.len(), 16);
+    let n_byte_groups = dim / 2;
+
+    // Rounding a scale to int8 is 16 values of work, so it rides along with
+    // the per-query build rather than being cached on the index.
+    let cmax = centroids.iter().fold(0.0f32, |m, &c| m.max(c.abs()));
+    let cs = if cmax > 0.0 { cmax / 127.0 } else { 1.0 };
+    let mut levels = [0i8; 16];
+    for (l, &c) in levels.iter_mut().zip(centroids.iter()) {
+        *l = (c / cs).round().clamp(-127.0, 127.0) as i8;
+    }
+
+    // One scale for the whole query row. Like the LUT path this is linear in
+    // the query magnitude, so scaling a query leaves the integer sums — and
+    // hence the ranking — untouched, down to where `1.0 / qs` stops being
+    // representable.
+    let qmax = q_rot_row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let qs = qmax / 127.0;
+    let (qs, inv_qs) = if qs >= f32::MIN_POSITIVE { (qs, 1.0 / qs) } else { (1.0, 1.0) };
+
+    let mut weights = vec![0i8; n_byte_groups * 2];
+    let mut wsum: i32 = 0;
+    for g in 0..n_byte_groups {
+        let (q4, j) = (g / 4, g % 4);
+        // Low nibble = odd dimension, high nibble = even. See `weights`.
+        let lo = (q_rot_row[2 * g + 1] * inv_qs).round().clamp(-127.0, 127.0) as i8;
+        let hi = (q_rot_row[2 * g] * inv_qs).round().clamp(-127.0, 127.0) as i8;
+        weights[q4 * 8 + j] = lo;
+        weights[q4 * 8 + 4 + j] = hi;
+        wsum += lo as i32 + hi as i32;
+    }
+
+    QueryPermuteDot {
+        levels,
+        levels2: [0; 16],
+        weights,
+        zero: -128 * wsum,
+        scale: cs * qs,
+        bias: 0.0,
+    }
+}
+
+/// H72: the SMMLA operand set for 2-bit codes. The query is rounded to i8
+/// per dimension in plain dimension order; the four codebook levels become
+/// two 16-entry tables (see `QueryPermuteDot::levels2`). `scale` restores
+/// both quantisations; `bias` receives the TQ+ correction from the caller.
+#[cfg(target_arch = "aarch64")]
+fn build_permute_dot_2bit(q_rot_row: &[f32], centroids: &[f32], dim: usize) -> QueryPermuteDot {
+    debug_assert!(centroids.len() >= 4);
+    let cmax = centroids[..4].iter().fold(0.0f32, |m, &c| m.max(c.abs()));
+    let cs = if cmax > 0.0 { cmax / 127.0 } else { 1.0 };
+    let mut lv = [0i8; 4];
+    for (l, &c) in lv.iter_mut().zip(centroids[..4].iter()) {
+        *l = (c / cs).round().clamp(-127.0, 127.0) as i8;
+    }
+    let mut levels = [0i8; 16];
+    let mut levels2 = [0i8; 16];
+    for i in 0..16 {
+        levels[i] = lv[i & 3];
+        levels2[i] = lv[(i >> 2) & 3];
+    }
+    let qmax = q_rot_row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let qs = qmax / 127.0;
+    let (qs, inv_qs) = if qs >= f32::MIN_POSITIVE { (qs, 1.0 / qs) } else { (1.0, 1.0) };
+    let weights: Vec<i8> = q_rot_row[..dim]
+        .iter()
+        .map(|&v| (v * inv_qs).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+    QueryPermuteDot { levels, levels2, weights, zero: 0, scale: cs * qs, bias: 0.0 }
+}
+
+/// H72: `SMMLA` A-operands for 2-bit codes in the `vm8` layout, once per
+/// tile. Field `k` of the unpacked 16-byte register holds, for two vectors,
+/// their dimensions `4g + k` for the octet's eight groups `g`; entry
+/// `(q8 * pairs + p) * 64 + k * 16` is the matching 2-query x 8-dim operand.
+#[cfg(target_arch = "aarch64")]
+fn build_smmla_a_vm8_2bit<const NQ: usize>(pds: &[&QueryPermuteDot; NQ], octs: usize) -> Vec<i8> {
+    let pairs = NQ / 2;
+    let mut a = vec![0i8; octs * pairs * 64];
+    for q8 in 0..octs {
+        for p in 0..pairs {
+            let dst = (q8 * pairs + p) * 64;
+            for k in 0..4 {
+                for (r, pd) in pds[2 * p..2 * p + 2].iter().enumerate() {
+                    for j in 0..8 {
+                        a[dst + k * 16 + r * 8 + j] = pd.weights[4 * (8 * q8 + j) + k];
+                    }
+                }
+            }
+        }
+    }
+    a
+}
 
 /// Build nibble LUTs for NEON/AVX2 scoring from a flat query rotation row.
 ///
@@ -997,12 +3485,29 @@ struct QueryNeonLut {
 /// rounding bias that a single global min produces when sub-tables
 /// have different value ranges (which they do for asymmetric-sign
 /// products of `q_rot[coord] * centroid[code]`).
-fn build_query_neon_lut_from_slice(
+#[cfg(test)]
+pub(crate) fn build_query_neon_lut_from_slice(
     q_rot_row: &[f32],
     centroids: &[f32],
     bits: usize,
     dim: usize,
 ) -> QueryNeonLut {
+    build_query_lut(q_rot_row, centroids, bits, dim, true)
+}
+
+/// [`build_query_neon_lut_from_slice`], optionally without the tables only
+/// a scan kernel reads. H116: under the planes layout the exact tables are
+/// read by the scalar rescore alone, so the `vpermb` reordering of them is
+/// 6 KB of copying per query that nothing looks at.
+fn build_query_lut(
+    q_rot_row: &[f32],
+    centroids: &[f32],
+    bits: usize,
+    dim: usize,
+    for_scan: bool,
+) -> QueryNeonLut {
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = for_scan;
     let codes_per_byte = 8 / bits;
     let codes_per_nibble = codes_per_byte / 2;
     let n_byte_groups = dim / codes_per_byte;
@@ -1019,7 +3524,68 @@ fn build_query_neon_lut_from_slice(
     for g in 0..n_byte_groups {
         let dim_start = g * codes_per_byte;
 
+        // H65: each entry is a sum of per-position products
+        // `q[d + c] * centroid[code_c]`; there are only `codes_per_nibble x
+        // 2^bits` distinct products per sub-table (8 at 2 bits, 16 at 4),
+        // not 16 x codes_per_nibble. Form them once and add them in the
+        // same order the per-entry loop did, so every f32 result is the
+        // same bit pattern.
+        let n_levels = 1usize << bits;
+        let mut prod = [[0.0f32; 16]; 4];
+        debug_assert!(codes_per_nibble <= 4 && n_levels <= 16);
+
+        if bits == 2 {
+            // H67: the 2-bit sub-table has a fixed shape — entry (a, b) is
+            // `q[d] * c[a] + q[d + 1] * c[b]` for a, b in 0..4 — so it is
+            // written as 4 + 4 products and 16 adds over fixed-size arrays,
+            // which LLVM vectorises on both arches. The sum is formed as
+            // `(0.0 + p_a) + p_b`, exactly the per-entry loop's order, so
+            // every f32 is the same bit pattern; min/max are exact.
+            let c4 = [centroids[0], centroids[1], centroids[2], centroids[3]];
+            let sub = |d: usize, out: &mut [f32]| -> (f32, f32) {
+                let pa = [q_rot_row[d] * c4[0], q_rot_row[d] * c4[1], q_rot_row[d] * c4[2], q_rot_row[d] * c4[3]];
+                let pb = [q_rot_row[d + 1] * c4[0], q_rot_row[d + 1] * c4[1], q_rot_row[d + 1] * c4[2], q_rot_row[d + 1] * c4[3]];
+                // H109: f32 addition is monotone in each operand, so the
+                // smallest (largest) of the sixteen sums is the sum of the
+                // two smallest (largest) addends — eight compares instead
+                // of thirty-two, and none inside the 16-entry loop.
+                let pa0 = [0.0f32 + pa[0], 0.0f32 + pa[1], 0.0f32 + pa[2], 0.0f32 + pa[3]];
+                for a in 0..4 {
+                    for b in 0..4 {
+                        out[a * 4 + b] = pa0[a] + pb[b];
+                    }
+                }
+                let ext = |x: &[f32; 4]| {
+                    let (mut mn, mut mx) = (x[0], x[0]);
+                    for &v in &x[1..] {
+                        mn = if v < mn { v } else { mn };
+                        mx = if v > mx { v } else { mx };
+                    }
+                    (mn, mx)
+                };
+                let ((amn, amx), (bmn, bmx)) = (ext(&pa0), ext(&pb));
+                (amn + bmn, amx + bmx)
+            };
+            let (lo_min, lo_max) = sub(dim_start, &mut float_vals[g * 32..g * 32 + 16]);
+            let (hi_min, hi_max) = sub(dim_start + 2, &mut float_vals[g * 32 + 16..g * 32 + 32]);
+            mins[g * 2] = lo_min;
+            mins[g * 2 + 1] = hi_min;
+            bias += lo_min + hi_min;
+            let lo_span = lo_max - lo_min;
+            let hi_span = hi_max - hi_min;
+            if lo_span > max_span { max_span = lo_span; }
+            if hi_span > max_span { max_span = hi_span; }
+            sum_spans += lo_span + hi_span;
+            continue;
+        }
+
         // lo nibble sub-table (16 entries)
+        for c in 0..codes_per_nibble {
+            let q = q_rot_row[dim_start + c];
+            for (code, cent) in centroids[..n_levels].iter().enumerate() {
+                prod[c][code] = q * cent;
+            }
+        }
         let mut lo_min = f32::MAX;
         let mut lo_max = f32::MIN;
         for nibble_val in 0u16..16 {
@@ -1027,7 +3593,7 @@ fn build_query_neon_lut_from_slice(
             for c in 0..codes_per_nibble {
                 let shift = (codes_per_nibble - 1 - c) * bits;
                 let code = (nibble_val >> shift) & code_mask;
-                s += q_rot_row[dim_start + c] * centroids[code as usize];
+                s += prod[c][code as usize];
             }
             float_vals[g * 32 + nibble_val as usize] = s;
             if s < lo_min { lo_min = s; }
@@ -1035,6 +3601,12 @@ fn build_query_neon_lut_from_slice(
         }
 
         // hi nibble sub-table (16 entries)
+        for c in 0..codes_per_nibble {
+            let q = q_rot_row[dim_start + codes_per_nibble + c];
+            for (code, cent) in centroids[..n_levels].iter().enumerate() {
+                prod[c][code] = q * cent;
+            }
+        }
         let mut hi_min = f32::MAX;
         let mut hi_max = f32::MIN;
         for nibble_val in 0u16..16 {
@@ -1042,7 +3614,7 @@ fn build_query_neon_lut_from_slice(
             for c in 0..codes_per_nibble {
                 let shift = (codes_per_nibble - 1 - c) * bits;
                 let code = (nibble_val >> shift) & code_mask;
-                s += q_rot_row[dim_start + codes_per_nibble + c] * centroids[code as usize];
+                s += prod[c][code as usize];
             }
             float_vals[g * 32 + 16 + nibble_val as usize] = s;
             if s < hi_min { hi_min = s; }
@@ -1060,40 +3632,85 @@ fn build_query_neon_lut_from_slice(
         sum_spans += lo_span + hi_span;
     }
 
-    // Per-query LUT cap. Both kernels now flush their integer accumulators
-    // every `FLUSH_EVERY = 256` byte-groups, so the per-flush sum constraint
-    // is the binding one: `FLUSH_EVERY * max_lut <= 65535` ⇒ max_lut ≤ 255.
+    // Per-query LUT cap. Both kernels flush their integer accumulators every
+    // `FLUSH_EVERY = 256` byte-groups, so the per-flush u16 sum constraint is
+    // `FLUSH_EVERY * max_lut <= 65535` ⇒ max_lut ≤ 255. That is not the
+    // binding constraint on ARM:
     //
-    // ARM: NEON does `vaddq_u8(lo, hi)` in u8 space first, which caps the
-    // u8 sum at 254 ⇒ max_lut ≤ 127. Use 127.
+    // ARM: NEON adds the two nibble lookups with `vaddq_u8(lo, hi)` before
+    // widening, so the *pair* sum must fit a u8: `2 * max_lut <= 255` ⇒
+    // max_lut ≤ 127. That u8 pre-add, not the flush, is the binding
+    // constraint, and 127 is exactly its ceiling (128 + 128 = 256 wraps).
     //
     // x86: AVX2 / AVX-512 accumulate u8 lookups directly into i16 lanes
     // via FAISS even/odd interleave + SUB-trick. With periodic flush, the
     // per-half u16 sum is bounded by `FLUSH_EVERY * max_lut`, allowing
     // max_lut up to ~255. We share 127 with ARM so codes encoded against
     // an x86-built index round identically to an ARM-built index — keeps
-    // the kernel arches numerically equivalent.
+    // the kernel arches numerically equivalent. Raising x86 alone would
+    // break that equivalence; raising ARM needs the u8 pre-add replaced by
+    // two widening adds (see #332).
     let _ = sum_spans; // retained for the FAISS-style data-dependent path; not
                        // used now that both kernels flush.
     let max_lut: f32 = 127.0;
 
-    let scale = if max_span > 1e-10 { max_span / max_lut } else { 1.0 };
-    let inv_scale = 1.0 / scale;
+    // `float_vals`, `mins` and `max_span` are all linear in the query
+    // magnitude, so the u8 LUT is magnitude-free and `scale` alone carries
+    // it: multiplying a query by a positive constant then leaves the integer
+    // sums — and hence the ranking — untouched. An *absolute* floor here
+    // (previously `max_span > 1e-10`) broke that invariant by forcing
+    // `scale = 1.0` for small queries, which rounds every LUT entry to 0 and
+    // destroys the ranking (#335). The only real limit is representability:
+    // `1.0 / scale` must stay finite, which holds until `scale` itself
+    // underflows to a subnormal — far below the point where the f32 score
+    // (an inner product, so it legitimately scales with the query) still has
+    // usable precision.
+    let scale = if max_span > 0.0 { max_span / max_lut } else { 1.0 };
+    let (scale, inv_scale) = if scale >= f32::MIN_POSITIVE {
+        (scale, 1.0 / scale)
+    } else {
+        (1.0, 1.0)
+    };
 
-    for g in 0..n_byte_groups {
-        let lo_min = mins[g * 2];
-        let hi_min = mins[g * 2 + 1];
-        for i in 0..16 {
-            let j_lo = g * 32 + i;
-            let j_hi = g * 32 + 16 + i;
-            uint8_luts[j_lo] =
-                ((float_vals[j_lo] - lo_min) * inv_scale).round().clamp(0.0, max_lut) as u8;
-            uint8_luts[j_hi] =
-                ((float_vals[j_hi] - hi_min) * inv_scale).round().clamp(0.0, max_lut) as u8;
-        }
+    // H65: `f32::round` is a libm call per entry (6,144 per query at dim
+    // 768) that the compiler cannot vectorise. `round_half_away` below is
+    // the same function — half away from zero — written from `trunc`, which
+    // is a single instruction, and `x - trunc(x)` is exact in f32, so every
+    // output byte is unchanged. Sixteen entries share a min, so the loop is
+    // shaped as one 16-lane chunk per sub-table.
+    //
+    // H108: the pass itself is `quantise_tables`, shared with the sign
+    // tables and written branch-free so it runs sixteen entries a step.
+    quantise_tables(&float_vals, &mins, inv_scale, max_lut, &mut uint8_luts);
+
+    // On the vector-major layout, 4-bit codes score through the permute-dot
+    // kernel and 2-bit codes through the arch's classic one; the two need
+    // different per-query tables and only one of them is ever built.
+    let vm = crate::pack::vector_major_for(bits, n_byte_groups);
+    let pd = if vm && bits == 4 {
+        Some(build_permute_dot(q_rot_row, centroids, dim))
+    } else {
+        None
+    };
+
+    QueryNeonLut {
+        #[cfg(target_arch = "x86_64")]
+        split: if vm && pd.is_none() && for_scan {
+            AlignedBytes::from_slice(&split_lut_for_vnni(&uint8_luts, n_byte_groups))
+        } else {
+            AlignedBytes::default()
+        },
+        #[cfg(target_arch = "aarch64")]
+        pd2: if crate::pack::vm8_2bit_for(bits, n_byte_groups) {
+            Some(build_permute_dot_2bit(q_rot_row, centroids, dim))
+        } else {
+            None
+        },
+        pd,
+        uint8_luts,
+        scale,
+        bias,
     }
-
-    QueryNeonLut { uint8_luts, scale, bias }
 }
 
 /// Slot-allowlist bitmask: packed little-endian, bit `i` set iff slot `i` is
@@ -1104,6 +3721,20 @@ pub(crate) fn mask_allows(mask: &[u64], slot: usize) -> bool {
     // Safety: caller validates mask length against n_vectors before reaching
     // any kernel; we never query past it in scoring loops.
     (mask[slot >> 6] >> (slot & 63)) & 1 != 0
+}
+
+/// The mask's 32-bit window for the block starting at `base_vec`: bit
+/// `lane` set iff that lane is allowed; all ones without a mask. The slot
+/// bitmap is packed 64 to a word and `base_vec` is a multiple of
+/// [`BLOCK`], so the window is one half of one word — one load, which a
+/// collector ANDs into its lanes-over-threshold bits (#557) instead of
+/// testing the lanes one at a time.
+#[inline(always)]
+pub(crate) fn block_mask_word(mask: Option<&[u64]>, base_vec: usize) -> u32 {
+    match mask {
+        None => u32::MAX,
+        Some(m) => (m[base_vec >> 6] >> (base_vec & 63)) as u32,
+    }
 }
 
 /// Block-level early-exit predicate: true iff at least one slot in the
@@ -1122,12 +3753,24 @@ pub(crate) fn block_has_allowed(mask: Option<&[u64]>, base_vec: usize) -> bool {
             let word = m[base_vec >> 6];
             let bit_offset = base_vec & 63;
             let allowed = ((word >> bit_offset) & 0xFFFF_FFFF) != 0;
+            #[cfg(feature = "mask-skip-counter")]
             if !allowed {
                 BLOCKS_SKIPPED_BY_MASK.fetch_add(1, Ordering::Relaxed);
             }
             allowed
         }
     }
+}
+
+/// Blocks per rayon range for the single-query block-parallel paths.
+///
+/// Rounded up to an even count so every range starts on a 64-slot
+/// boundary: that is exactly one `u64` mask word, which is what lets a
+/// masked search hand each range a word-aligned sub-slice of the bitmap
+/// and keep indexing it range-relative like the codes and scales.
+#[inline]
+pub(crate) fn block_range_stride(n_blocks: usize, n_threads: usize) -> usize {
+    (n_blocks.div_ceil(n_threads)).max(64).next_multiple_of(2)
 }
 
 /// Pair-level early-exit predicate for the AVX-512BW kernel which scores
@@ -1141,8 +3784,9 @@ pub(crate) fn block_pair_has_allowed(mask: Option<&[u64]>, base_vec_pair: usize)
         None => true,
         Some(m) => {
             let allowed = m[base_vec_pair >> 6] != 0;
+            // A pair-level skip short-circuits two 32-vector blocks.
+            #[cfg(feature = "mask-skip-counter")]
             if !allowed {
-                // A pair-level skip short-circuits two 32-vector blocks.
                 BLOCKS_SKIPPED_BY_MASK.fetch_add(2, Ordering::Relaxed);
             }
             allowed
@@ -1170,13 +3814,17 @@ fn score_query_into_heap(
     qlut_bias: f32,
     blocked_codes: &[u8],
     vec_scales: &[f32],
+    bits: usize,
     n_byte_groups: usize,
     n_vectors: usize,
     n_blocks: usize,
     mask: Option<&[u64]>,
     k: usize,
     heap_s: &mut [f32],
-    heap_i: &mut [u32],
+    // u64, not u32: the on-disk format's count field is u64 (format v4),
+    // so vector indices can legitimately exceed u32::MAX; a u32 heap
+    // slot would silently truncate them.
+    heap_i: &mut [u64],
     heap_sz: &mut usize,
     heap_min: &mut f32,
     heap_mi: &mut usize,
@@ -1186,7 +3834,6 @@ fn score_query_into_heap(
         if !block_has_allowed(mask, base_vec) {
             continue;
         }
-        let block_offset = b * n_byte_groups * BLOCK;
         for lane in 0..BLOCK {
             let vi = base_vec + lane;
             if vi >= n_vectors {
@@ -1199,18 +3846,14 @@ fn score_query_into_heap(
             }
             let mut score = qlut_bias;
             for g in 0..n_byte_groups {
-                // The x86 blocked layout is perm0-interleaved hi/lo nibbles,
-                // so de-interleave this vector's byte before decoding (issue
-                // #106). Every other target stores the sequential layout that
-                // can be read directly.
-                #[cfg(target_arch = "x86_64")]
-                let byte_val = crate::pack::deinterleave_x86_code_byte(
-                    blocked_codes,
-                    block_offset + g * BLOCK,
-                    lane,
-                ) as usize;
-                #[cfg(not(target_arch = "x86_64"))]
-                let byte_val = blocked_codes[block_offset + g * BLOCK + lane] as usize;
+                // x86 has two possible native layouts (perm0-interleaved
+                // nibble planes, or vector-major for the VNNI kernel), so go
+                // through the shared accessor rather than assuming either;
+                // every other target stores the sequential layout directly.
+                // Reading the wrong one here would silently mis-score
+                // (issue #106 is the original perm0 instance of this).
+                let byte_val =
+                    crate::pack::read_code(blocked_codes, bits, n_byte_groups, b, g, lane) as usize;
                 let hi = byte_val >> 4;
                 let lo = byte_val & 0x0F;
                 score += qlut_scale * qlut_uint8[g * 32 + hi] as f32;
@@ -1219,29 +3862,19 @@ fn score_query_into_heap(
             score *= vec_scales[vi];
             if *heap_sz < k {
                 heap_s[*heap_sz] = score;
-                heap_i[*heap_sz] = vi as u32;
+                heap_i[*heap_sz] = vi as u64;
                 *heap_sz += 1;
                 if *heap_sz == k {
-                    *heap_min = heap_s[0];
-                    *heap_mi = 0;
-                    for h in 1..k {
-                        if heap_s[h] < *heap_min {
-                            *heap_min = heap_s[h];
-                            *heap_mi = h;
-                        }
-                    }
+                    let (m, mi) = rescan_min(heap_s, heap_i, k);
+                    *heap_min = m;
+                    *heap_mi = mi;
                 }
             } else if score > *heap_min {
                 heap_s[*heap_mi] = score;
-                heap_i[*heap_mi] = vi as u32;
-                *heap_min = heap_s[0];
-                *heap_mi = 0;
-                for h in 1..k {
-                    if heap_s[h] < *heap_min {
-                        *heap_min = heap_s[h];
-                        *heap_mi = h;
-                    }
-                }
+                heap_i[*heap_mi] = vi as u64;
+                let (m, mi) = rescan_min(heap_s, heap_i, k);
+                *heap_min = m;
+                *heap_mi = mi;
             }
         }
     }
@@ -1294,10 +3927,20 @@ fn calibrate_queries(
 /// `min(k, popcount(mask))`.
 ///
 /// Returns (scores_flat, indices_flat) each of length nq * effective_k.
-pub fn search(
+///
+/// Crate-internal (soundness-critical). The unsafe SIMD kernels index
+/// `blocked_codes` using the caller-supplied `n_vectors`/`n_blocks` scalars
+/// with no consistency check, so passing a `blocked_codes` buffer that does
+/// not match those scalars causes an out-of-bounds read (silent info
+/// disclosure) or a SIGBUS — undefined behaviour from otherwise-safe code.
+/// Every field here is established by [`TurboQuantIndex::search_with_mask`]
+/// from an index whose parts were validated at construction
+/// ([`from_parts`](crate::TurboQuantIndex::from_parts)); it is not exposed
+/// publicly for that reason.
+pub(crate) fn search(
     queries: &[f32],    // (nq, dim) row-major
     nq: usize,
-    rotation: &[f32],   // (dim, dim) row-major
+    rotation: &Rotation,
     blocked_codes: &[u8],
     centroids: &[f32],
     vec_scales: &[f32],
@@ -1309,6 +3952,7 @@ pub fn search(
     n_blocks: usize,
     k: usize,
     mask: Option<&[u64]>,
+    planes: Option<PlanesRef<'_>>,
 ) -> (Vec<f32>, Vec<i64>) {
     let n_allowed = match mask {
         Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
@@ -1320,23 +3964,17 @@ pub fn search(
     }
     let n_byte_groups = dim / (8 / bits);
 
-    // Batched rotation: q_rot = queries @ rotation^T via a single GEMM.
-    // Much faster than per-query matvec loops because it saturates FMA throughput
-    // and reuses the rotation matrix across queries.
-    let mut q_rot = vec![0.0f32; nq * dim];
-    {
-        let q_ref = faer::mat::from_row_major_slice::<f32, _, _>(queries, nq, dim);
-        let r_ref = faer::mat::from_row_major_slice::<f32, _, _>(rotation, dim, dim);
-        let out_mut = faer::mat::from_row_major_slice_mut::<f32, _, _>(&mut q_rot, nq, dim);
-        faer::linalg::matmul::matmul(
-            out_mut,
-            q_ref,
-            r_ref.transpose(),
-            None,
-            1.0_f32,
-            faer::Parallelism::Rayon(0),
-        );
-    }
+    // Rotate each query row in place with the same deterministic
+    // block-Hadamard transform the encode path applies to the database, so
+    // query and database vectors live in the same rotated space by
+    // construction (one shared rotation, no GEMM, no BLAS). Reduction-free
+    // per row, so the result does not depend on the thread count.
+    let mut q_rot = queries.to_vec();
+    q_rot
+        .par_chunks_mut(dim)
+        .for_each_init(|| vec![0.0f32; dim], |scratch, row| {
+            rotation.apply_with_scratch(row, scratch)
+        });
 
     // TQ+ per-coord (shift, scale) was applied to the database at encode
     // time. At search time we apply the inverse to the query:
@@ -1350,72 +3988,2286 @@ pub fn search(
 
     // Build LUTs in parallel; fold the TQ+ bias correction into each lut's
     // bias so the kernel doesn't need to know TQ+ exists.
-    let query_luts: Vec<QueryNeonLut> = (0..nq)
-        .into_par_iter()
-        .map(|qi| {
+    let build_exact_luts = || -> Vec<QueryNeonLut> {
+        per_query(nq, |qi| {
             let row = &q_for_lut[qi * dim..(qi + 1) * dim];
-            let mut lut = build_query_neon_lut_from_slice(row, centroids, bits, dim);
+            let mut lut = build_query_lut(row, centroids, bits, dim, planes.is_none());
             lut.bias += bias_corrs[qi];
+            if let Some(pd) = lut.pd.as_mut() {
+                // The permute-dot kernel carries its own scale/bias, so the
+                // TQ+ correction has to land there too.
+                pd.bias += bias_corrs[qi];
+            }
+            #[cfg(target_arch = "aarch64")]
+            if let Some(pd) = lut.pd2.as_mut() {
+                pd.bias += bias_corrs[qi];
+            }
             lut
         })
-        .collect();
+    };
+    // H103/H105: under the planes layout the exact tables are read only by
+    // the rescore, after the sign scan. For one query on a pool the worker
+    // that owns the scan builds them once the other ranges are handed out,
+    // instead of serially before the scan starts.
+    let defer_exact = planes.is_some() && nq == 1 && rayon::current_num_threads() > 1;
+    // A 4-bit planes search rescores with its own operands (`Exact4`), not
+    // these tables.
+    let planes4 = planes.is_some() && bits == 4;
+    let query_luts: Vec<QueryNeonLut> =
+        if defer_exact || planes4 { Vec::new() } else { build_exact_luts() };
+    let build_exact4 = || -> Vec<Exact4> {
+        per_query(nq, |qi| {
+            let mut pd = build_permute_dot(&q_for_lut[qi * dim..(qi + 1) * dim], centroids, dim);
+            pd.bias += bias_corrs[qi];
+            Exact4::new(&pd, dim)
+        })
+    };
 
+    // H99: a planes cache (`pack::planes_for`). `blocked_codes` is the sign
+    // region, which the nibble kernels scan as an index with half the
+    // byte-groups for a shortlist; the shortlist is then rescored from both
+    // planes with the exact scan's own arithmetic, so the returned scores
+    // are unchanged.
+    if let Some(PlanesRef { low: low_rows, stats, sample, centre }) = planes {
+        debug_assert!(bits == 2 || bits == 4);
+        let m = stats.m;
+        let n_low = bits - 1;
+        // H5: the sign stage selects on the query pulled toward the centre
+        // (`q' + SIGN_CENTRE * shift / scale` in table space); every later
+        // stage reads plain tables, and a candidate's carried score is
+        // brought back to the plain one with `centre` below.
+        let q_for_sign: std::borrow::Cow<'_, [f32]> = match centre {
+            Some(_) => {
+                let mut v = q_for_lut.clone();
+                for row in v.chunks_mut(dim) {
+                    for (d, x) in row.iter_mut().enumerate() {
+                        *x += SIGN_CENTRE * tqplus_shift[d] / tqplus_scale[d];
+                    }
+                }
+                std::borrow::Cow::Owned(v)
+            }
+            None => std::borrow::Cow::Borrowed(q_for_lut.as_slice()),
+        };
+        let sign_luts: Vec<QueryNeonLut> = per_query(nq, |qi| {
+            let mut lut = build_sign_lut(
+                &q_for_sign[qi * dim..(qi + 1) * dim], m, dim,
+                cfg!(target_arch = "aarch64") && nq == 1,
+            );
+            lut.bias += bias_corrs[qi];
+            lut
+        });
+        let s_len = planes_shortlist_len(k, bits);
+        // H100: the shortlist's sign scores, plus the low plane counted
+        // against the query's bit masks, estimate each candidate's exact
+        // score closely enough that only the best few need the full
+        // rescore.
+        let t_len = planes_rescore_len(k, bits);
+        // One query on an x86 pool with a small shortlist skips the
+        // ranking: its exact rescore of the whole shortlist spreads across
+        // the workers, which is quicker than ranking it on one (measured
+        // up to a shortlist of ~500). aarch64 ranks inside the scan's
+        // workers instead (`in_range_refine`).
+        // Only when the scan itself is on the pool: a masked scan that
+        // runs on the calling thread (#554, #557) would pay the handoff
+        // here instead.
+        let rescore_all_on_pool = cfg!(target_arch = "x86_64")
+            && nq == 1
+            && rayon::current_num_threads() > 1
+            && allowed_blocks(mask, n_blocks) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+            && s_len < PLANES_POOL_RANK_MIN;
+        let refines = s_len < n_allowed && t_len < s_len && !rescore_all_on_pool;
+        // At 4 bits aarch64 ranks through the sign tables, 32 candidates
+        // at a time (`plane_terms`); otherwise the bit masks are counted.
+        let low_planes: Vec<LowPlanes> = if refines && !(cfg!(target_arch = "aarch64") && bits == 4) {
+            per_query(nq, |qi| build_low_planes(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim))
+        } else {
+            Vec::new()
+        };
+        // H5: the aarch64 4-bit ranking reads sign tables; it ranks on the
+        // plain query, so it gets plain tables when the scan's are centred.
+        let plain_luts: Vec<QueryNeonLut> =
+            if refines && cfg!(target_arch = "aarch64") && bits == 4 && centre.is_some() {
+                per_query(nq, |qi| {
+                    let mut lut = build_sign_lut(
+                        &q_for_lut[qi * dim..(qi + 1) * dim], m, dim,
+                        cfg!(target_arch = "aarch64") && nq == 1,
+                    );
+                    lut.bias += bias_corrs[qi];
+                    lut
+                })
+            } else {
+                Vec::new()
+            };
+        let refine = refines.then(|| Refine {
+            low_planes: &low_planes,
+            sign_luts: if plain_luts.is_empty() { &sign_luts } else { &plain_luts },
+            bias_corrs: &bias_corrs,
+            a_over_m: stats.alpha / m,
+            b_over_m: [stats.beta[0] / m, stats.beta[1] / m, stats.beta[2] / m],
+            n_low,
+            a1_over_m: stats.alpha1 / m,
+            b1_over_m: stats.beta1 / m,
+            mid_len: planes_mid_len(k),
+            t_len,
+        });
+        // H106: one query on a pool refines inside the scan — each worker
+        // rewrites its range's candidates' scores to the refined estimate
+        // before the merge, so the merge ranks by it and the owner rescores
+        // the best `t_len` itself. No second fork-join. Needs the
+        // single-query parallel scan (`single_query_parallelizes`) and a
+        // collector, both of which the shortlist branch below checks.
+        // H15 (4-bit round 2): x86 too, once the shortlist is large enough
+        // that the first pass is worth spreading (under
+        // `PLANES_POOL_RANK_MIN` it skips ranking anyway).
+        let in_range_refine = defer_exact
+            && (cfg!(target_arch = "aarch64") || s_len >= PLANES_POOL_RANK_MIN)
+            && refine.is_some()
+            && mask.is_none()
+            && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+            && planes_buffered_supported(&sign_luts)
+            && 2 * s_len < n_vectors;
+        // H5: a candidate's score under the centred tables, back to its score
+        // under the plain ones.
+        let plain_score = |v: usize, s: f32| -> f32 {
+            match centre {
+                Some(c) => s - SIGN_CENTRE * vec_scales[v] * c[v],
+                None => s,
+            }
+        };
+        let refine_range = |v: &mut [(f32, u64)]| {
+            if let Some(r) = refine.as_ref() {
+                let mut c: Vec<(usize, f32)> =
+                    v.iter().map(|e| (e.1 as usize, plain_score(e.1 as usize, e.0))).collect();
+                rank_first(r, 0, low_rows, dim / 8, &mut c, vec_scales);
+                for (e, n) in v.iter_mut().zip(&c) {
+                    e.0 = n.1;
+                }
+            }
+        };
+        let late_luts: std::sync::OnceLock<Vec<QueryNeonLut>> = std::sync::OnceLock::new();
+        let late4: std::sync::OnceLock<Vec<Exact4>> = std::sync::OnceLock::new();
+        let build_late = || {
+            if bits == 4 {
+                late4.get_or_init(&build_exact4);
+            } else {
+                late_luts.get_or_init(&build_exact_luts);
+            }
+        };
+        let shortlist = || -> Vec<Vec<(usize, f32)>> { if s_len >= n_allowed {
+            // Nothing to shortlist: every allowed vector is rescored.
+            let all: Vec<(usize, f32)> = (0..n_vectors)
+                .filter(|&v| mask.is_none_or(|am| mask_allows(am, v)))
+                .map(|v| (v, 0.0))
+                .collect();
+            vec![all; nq]
+        } else {
+            // A buffered collector of capacity 2S always holds its range's
+            // top S, so the merged list's first S are the plane's global
+            // top S. The collectors apply the mask to their lanes (#557),
+            // so a masked scan takes the same route over the vectors the
+            // mask allows; before that it fell to a plain top-S heap,
+            // whose per-lane upkeep at S = 256 made a masked search
+            // slower than an unmasked one.
+            let buffered = planes_buffered_supported(&sign_luts) && 2 * s_len < n_allowed;
+            let stride = if buffered { 2 * s_len } else { s_len };
+            let nsg = dim / 8;
+            // Seed each query's collector threshold from a strided sample
+            // of blocks: the sample's r-th best score, with r chosen so
+            // more than a shortlist's worth of the whole index lies above
+            // it. A collector then admits a few hundred candidates in
+            // total instead of ratcheting a top-S per range. The seed is a
+            // guess, so a query that comes back short is rescanned unseeded.
+            //
+            // How far to overshoot follows from how well the sample pins
+            // the threshold. With `r_s` sample vectors expected in a
+            // shortlist, the count above the r-th best spreads by about
+            // `1 / sqrt(r)`: a small shortlist needs four of itself, a
+            // large one is as safe at little over two, and everything
+            // admitted past the shortlist is collected, merged and ranked
+            // for nothing.
+            let sample_seeds = |s_codes: &[u8], s_scales: &[f32]| -> Vec<f32> {
+                let n_s = s_scales.len();
+                let r_s = (s_len * n_s) as f32 / n_vectors as f32;
+                // 4 bits shortlists 20 per result where 2 bits takes 16,
+                // so the same margin admits more for nothing; a seed that
+                // runs short costs that one query a second scan.
+                let width = if bits == 4 { 4.0 } else { 6.0 };
+                let over = (1.0 + width / r_s.max(1.0).sqrt()).min(4.0);
+                let r = ((over * r_s).ceil() as usize).max(6).min(n_s);
+                // The sample is too small for the scan to split by itself,
+                // and a large batch pays for it one query after another:
+                // split the batch across the pool here.
+                let threads = rayon::current_num_threads().max(1);
+                if nq >= 4 * threads && threads > 1 {
+                    let chunk = nq.div_ceil(threads);
+                    return (0..nq)
+                        .into_par_iter()
+                        .step_by(chunk)
+                        .flat_map_iter(|a| {
+                            let b = (a + chunk).min(nq);
+                            let (ss, _) = scan_with_luts(
+                                &sign_luts[a..b], b - a, s_codes, s_scales, 2, nsg, nsg * BLOCK,
+                                n_s, n_s / BLOCK, r, None, false, None, SingleHooks::default(),
+                            );
+                            (0..b - a).map(move |qi| ss[qi * r + r - 1]).collect::<Vec<f32>>()
+                        })
+                        .collect();
+                }
+                let (ss, _) = scan_with_luts(
+                    &sign_luts, nq, s_codes, s_scales, 2, nsg, nsg * BLOCK, n_s,
+                    n_s / BLOCK, r, None, false, None, SingleHooks::default(),
+                );
+                (0..nq).map(|qi| ss[qi * r + r - 1]).collect()
+            };
+            // H113: one query on a pool computes its seed inside the scan,
+            // on the owning worker, while the helpers are still starting.
+            // The sample is of the whole index, so under a mask its r-th
+            // best says nothing about the allowed vectors' — a selective
+            // mask would run short on nearly every query and pay the
+            // unseeded rescan on top. A masked scan starts unseeded.
+            let seed_in_scan = defer_exact
+                && buffered
+                && mask.is_none()
+                && sample.is_some()
+                && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS;
+            let seed_late = || -> f32 {
+                match sample {
+                    Some((s_codes, s_scales)) => sample_seeds(s_codes, s_scales)[0],
+                    None => f32::NEG_INFINITY,
+                }
+            };
+            let seeds: Option<Vec<f32>> = match sample {
+                Some((s_codes, s_scales)) if buffered && mask.is_none() && !seed_in_scan => {
+                    Some(sample_seeds(s_codes, s_scales))
+                }
+                _ => None,
+            };
+            let (mut sc, mut short) = scan_with_luts(
+                &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
+                n_vectors, n_blocks, stride, mask, buffered, seeds.as_deref(),
+                SingleHooks {
+                    k_hint: if bits == 4 { k } else { 0 },
+                    seed_late: seed_in_scan.then_some(&seed_late as &(dyn Fn() -> f32 + Sync)),
+                    owner_first: defer_exact.then_some(&build_late as &(dyn Fn() + Sync)),
+                    post_range: in_range_refine
+                        .then_some(&refine_range as &(dyn Fn(&mut [(f32, u64)]) + Sync)),
+                },
+            );
+            // A query whose seed left it short is rescanned unseeded, and
+            // only that query: about one in a thousand comes back short, so
+            // a batch of a thousand nearly always holds one, and rescanning
+            // the whole batch for it would cost every query a second scan.
+            let short_q: Vec<usize> = if seeds.is_some() || seed_in_scan {
+                (0..nq).filter(|&qi| sc[qi * s_len + s_len - 1] == f32::NEG_INFINITY).collect()
+            } else {
+                Vec::new()
+            };
+            if !short_q.is_empty() && nq > 1 {
+                // A lone short query scans through the single-query kernel,
+                // which on aarch64 reads the deferred-widening tables.
+                let deferred = cfg!(target_arch = "aarch64") && short_q.len() == 1;
+                let sub_luts: Vec<QueryNeonLut> = short_q
+                    .iter()
+                    .map(|&qi| {
+                        let mut lut =
+                            build_sign_lut(&q_for_sign[qi * dim..(qi + 1) * dim], m, dim, deferred);
+                        lut.bias += bias_corrs[qi];
+                        lut
+                    })
+                    .collect();
+                let (sub_sc, sub_ids) = scan_with_luts(
+                    &sub_luts, short_q.len(), blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
+                    n_vectors, n_blocks, stride, mask, buffered, None, SingleHooks::default(),
+                );
+                for (j, &qi) in short_q.iter().enumerate() {
+                    sc[qi * s_len..(qi + 1) * s_len]
+                        .copy_from_slice(&sub_sc[j * s_len..(j + 1) * s_len]);
+                    short[qi * s_len..(qi + 1) * s_len]
+                        .copy_from_slice(&sub_ids[j * s_len..(j + 1) * s_len]);
+                }
+            } else if !short_q.is_empty() {
+                (sc, short) = scan_with_luts(
+                    &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
+                    n_vectors, n_blocks, stride, mask, buffered, None,
+                    SingleHooks {
+                        k_hint: if bits == 4 { k } else { 0 },
+                        seed_late: None,
+                        owner_first: None,
+                        post_range: in_range_refine
+                            .then_some(&refine_range as &(dyn Fn(&mut [(f32, u64)]) + Sync)),
+                    },
+                );
+            }
+            // Both come back `s_len` wide (see `scan_with_luts`).
+            (0..nq)
+                .into_par_iter()
+                .map(|qi| {
+                    short[qi * s_len..(qi + 1) * s_len]
+                        .iter()
+                        .zip(&sc[qi * s_len..(qi + 1) * s_len])
+                        .filter(|(&i, _)| i >= 0 && (i as usize) < n_vectors)
+                        // In-range refine already handed back plain scores
+                        // (`refine_range`); only the scan's own are centred.
+                        .map(|(&i, &s)| (i as usize, if in_range_refine { s } else { plain_score(i as usize, s) }))
+                        .collect()
+                })
+                .collect()
+        } };
+        let ids = shortlist();
+        // A path that never reached the owning worker's hook (a small
+        // index, a mask, everything rescored) builds the tables here.
+        let exact_luts: &[QueryNeonLut] = if bits == 4 {
+            &[]
+        } else if defer_exact {
+            late_luts.get_or_init(&build_exact_luts)
+        } else {
+            &query_luts
+        };
+        let exact4: Option<&[Exact4]> =
+            (bits == 4).then(|| late4.get_or_init(&build_exact4).as_slice());
+        // In-range refine already ranked the list by the first pass: keep
+        // its head. With one low plane that is the whole ranking; with
+        // three, the rerank below runs the second pass on what is kept.
+        let first_done = in_range_refine;
+        let (ids, refine) = if in_range_refine {
+            let keep = refine.as_ref().map_or(usize::MAX, |r| if n_low > 1 { r.mid_len } else { r.t_len });
+            let ids = ids
+                .into_iter()
+                .map(|mut v| {
+                    if v.len() > keep {
+                        v.select_nth_unstable_by(keep - 1, |a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        v.truncate(keep);
+                    }
+                    v
+                })
+                .collect::<Vec<_>>();
+            (ids, if n_low > 1 { refine } else { None })
+        } else {
+            (ids, refine)
+        };
+        return rerank_legacy(
+            exact_luts, exact4, &ids, refine.as_ref(), first_done, nq, blocked_codes, low_rows,
+            vec_scales, dim / 8, n_low, k,
+        );
+    }
+
+    scan_with_luts(
+        &query_luts, nq, blocked_codes, vec_scales, bits, n_byte_groups, n_byte_groups * BLOCK,
+        n_vectors, n_blocks, k, mask, false, None, SingleHooks::default(),
+    )
+}
+
+/// H99: what a search needs beyond the sign region when the cache is in
+/// the planes layout (`pack::planes_for`).
+pub(crate) struct PlanesRef<'a> {
+    /// The low region: one row per vector, `dim / 8` bytes per low bit
+    /// plane, least significant plane first.
+    pub(crate) low: &'a [u8],
+    /// How to weigh the sign plane and estimate a level from its bits.
+    pub(crate) stats: crate::pack::PlanesStats,
+    /// A strided sample of sign-region blocks and their vector scales.
+    pub(crate) sample: Option<(&'a [u8], &'a [f32])>,
+    /// H5: `pack::planes_centre`, present on a calibrated index.
+    pub(crate) centre: Option<&'a [f32]>,
+}
+
+/// H5 (1-bit climb): how far the sign stage's query is pulled toward the
+/// coordinates' centre, as a fraction of the TQ+ shift. The sign estimate
+/// of a score carries a term, `sum_d c_d * sign_d`, that is a noisy
+/// estimate of a quantity nearly constant across a query's neighbours on
+/// corpora with a strong shared direction (MedCPT: 17.8% of queries had a
+/// top-10 member past rank 256 of the sign ranking, 0.5% with the pull);
+/// the pull removes most of it. 0.5 measured best (0.75 equal or slightly
+/// worse, 1.0 overshoots); isotropic corpora are unchanged by it.
+const SIGN_CENTRE: f32 = 0.5;
+
+/// H99: shortlist length for a top-`k` request. P45 measured the sign
+/// plane's miss rate against shortlist size on real embeddings: 12.8x k
+/// with a floor of 128 sat at or past the 99.9% point for k = 1, 10, 100
+/// on the OpenAI and mpnet corpora. #562's MedCPT corpus needs more at
+/// 2 bits, where the sign is half of every code: `max(384, 16k)` keeps
+/// recall within 0.1% of the whole-index scan's at k = 1, 10 and 100
+/// (99.91-100%; 12.8x k with a floor of 128 lost 0.7% at k = 10 and 0.2%
+/// at k = 100, and a floor of 256 still lost 0.15% at k = 10).
+///
+/// At 4 bits the sign is a smaller share of a score and the plane needs
+/// more: 18-30 per result held the exact top-k for 99.9% of queries on the
+/// three corpora of LOG_search.md P1 (worst: 180 at k=10, 1,781 at k=100).
+/// How many of a 4-bit shortlist's first-pass best are ranked on all three
+/// low planes. P1: the top two bits put the exact top-k inside the first
+/// 4-5 per result (48 at k=10, 416 at k=100 for 99.9% of queries).
+fn planes_mid_len(k: usize) -> usize {
+    // H5: floor 256, from 96 — with the sign stage's centred selection the
+    // candidates it rescues rank low on the first pass's two-bit estimate,
+    // and a cut at 96 lost them (MedCPT k=10, with the rescore floor of 64:
+    // recall 99.80% of the whole-index scan's -> 99.94%).
+    (6 * k).max(256)
+}
+
+fn planes_shortlist_len(k: usize, bits: usize) -> usize {
+    if bits == 4 {
+        // H27 (4-bit round 2): 16k from k = 64 (H25: 16k at every k
+        // lost the k <= 32 cells).
+        (if k >= 64 { k * 16 } else { k * 20 }).max(256)
+    } else {
+        (k * 16).max(384)
+    }
+}
+
+/// H105/H106: `work(i)` for `i in 0..n` on the pool, results in order,
+/// with the calling worker never parked on a latch.
+///
+/// A `par_iter` over a handful of equal ranges ends with the worker that
+/// owns it idle: it finishes its own range, waits on rayon's latch for the
+/// stolen ones, falls asleep, and is woken tens of microseconds after the
+/// last of them is done (P46: 38 us on Axion, 43 us on Sapphire Rapids,
+/// against a 100-170 us range).
+///
+/// Here every participant claims items from a shared counter. The owner
+/// spawns one helper per other worker, runs `owner_first` — serial work
+/// that the helpers' start-up latency hides — and then claims items like
+/// any helper, so a helper that starts late simply takes fewer. When the
+/// counter runs out the owner spins on a completion count for the items
+/// still in flight instead of sleeping; the spin is bounded, and past it
+/// the scope's own wait takes over.
+/// One value per query, computed on the pool for a batch and on the
+/// calling thread for one query (#557): a parallel iterator over a single
+/// item still injects a job into the pool and waits for a worker to wake,
+/// which on a masked nq=1 search that scans serially was most of the
+/// time left over the one-thread figure.
+fn per_query<R: Send>(nq: usize, f: impl Fn(usize) -> R + Sync + Send) -> Vec<R> {
+    if nq <= 1 {
+        (0..nq).map(f).collect()
+    } else {
+        (0..nq).into_par_iter().map(f).collect()
+    }
+}
+
+fn pool_map_spin<R: Send>(
+    n: usize,
+    // H113: run by the owner once the helpers are spawned and before any
+    // item is claimed; the helpers wait on a flag until it returns. Work
+    // every item depends on goes here, where it overlaps the helpers'
+    // start-up latency instead of preceding it.
+    owner_pre: Option<&(dyn Fn() + Sync)>,
+    owner_first: Option<&(dyn Fn() + Sync)>,
+    work: &(dyn Fn(usize) -> R + Sync),
+) -> Vec<R> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    const SPIN_LIMIT: std::time::Duration = std::time::Duration::from_micros(200);
+    if n <= 1 {
+        if let Some(f) = owner_pre {
+            f();
+        }
+        if let Some(f) = owner_first {
+            f();
+        }
+        return (0..n).map(work).collect();
+    }
+    let go = AtomicBool::new(owner_pre.is_none());
+    let slots: Vec<Mutex<Option<R>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let run = || {
+        while !go.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            let r = work(i);
+            *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            done.fetch_add(1, Ordering::Release);
+        }
+    };
+    rayon::scope(|s| {
+        let helpers = (rayon::current_num_threads().max(1) - 1).min(n - 1);
+        // H114: a binary tree of spawns. Each `spawn` wakes a sleeping
+        // worker, and seven of them in a row cost the owner ~12 us before
+        // it reached its own work (P46 on H113); here it pays for one and
+        // the woken helpers wake the rest.
+        spawn_tree(s, helpers, &run);
+        if let Some(f) = owner_pre {
+            f();
+            go.store(true, Ordering::Release);
+        }
+        if let Some(f) = owner_first {
+            f();
+        }
+        run();
+        let t = std::time::Instant::now();
+        let mut spins = 0u32;
+        while done.load(Ordering::Acquire) < n {
+            std::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins % 64 == 0 && t.elapsed() > SPIN_LIMIT {
+                break;
+            }
+        }
+    });
+    slots
+        .into_iter()
+        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).expect("every item ran"))
+        .collect()
+}
+
+/// Spawn `n` tasks running `run` into `s` as a binary tree: one spawn
+/// here, and each task spawns its two subtrees before it runs.
+fn spawn_tree<'s>(s: &rayon::Scope<'s>, n: usize, run: &'s (dyn Fn() + Sync)) {
+    if n == 0 {
+        return;
+    }
+    let left = (n - 1) / 2;
+    let right = n - 1 - left;
+    s.spawn(move |s| {
+        spawn_tree(s, left, run);
+        spawn_tree(s, right, run);
+        run();
+    });
+}
+
+/// H105/H106: what a single-query parallel scan runs besides its ranges.
+#[derive(Clone, Copy, Default)]
+struct SingleHooks<'a> {
+    /// H113: computes the scan's starting threshold on the owning worker
+    /// while the helpers start up; they claim nothing until it returns.
+    seed_late: Option<&'a (dyn Fn() -> f32 + Sync)>,
+    /// Serial work for the owning worker, once the helpers are spawned.
+    owner_first: Option<&'a (dyn Fn() + Sync)>,
+    /// Applied by each worker to a range's candidates (absolute indices)
+    /// before they are merged.
+    post_range: Option<&'a (dyn Fn(&mut [(f32, u64)]) + Sync)>,
+    /// The caller's own `k` when the scan's `k` is a collector's capacity,
+    /// for the aarch64 block-range cap (0: derive it from the capacity at
+    /// the 2-bit shortlist's 25.6 per result).
+    k_hint: usize,
+}
+
+/// Smallest shortlist one query on an x86 pool ranks before rescoring.
+const PLANES_POOL_RANK_MIN: usize = 640;
+
+/// Items per worker in a single-query parallel sign scan (H106): items
+/// are claimed, so a helper that starts late takes fewer.
+const PLANES_PIECES_PER_WORKER: usize = 2;
+
+/// H100: how many of a shortlist's candidates get the exact rescore after
+/// the refine pass ranks them: two per result with a floor of 32. On the
+/// three embedding corpora of the id gate the result reads the same at
+/// 1.5 per result and collapses at one (LOG_2bit.md, round 3), so two
+/// keeps a margin.
+fn planes_rescore_len(k: usize, bits: usize) -> usize {
+    // H2 (4-bit round 2): the three-plane ranking puts the exact top-k
+    // inside its first 1.4k on all three gate corpora (LOG_search.md P1).
+    // H5: floors 64, from 32 (see `planes_mid_len`; at 2 bits the floor
+    // carries k = 10 with the wider shortlist).
+    if bits == 4 { (3 * k / 2).max(64) } else { (2 * k).max(64) }
+}
+
+/// Bits of a query coordinate's magnitude the refine pass keeps.
+const LOW_BITS: usize = 6;
+/// Bytes of a low row one group of [`LowPlanes`] masks covers.
+const LOW_CHUNK: usize = 64;
+
+/// One query as bit masks over a low row, for the refine pass.
+///
+/// A low row holds one bit per coordinate (first coordinate in each byte's
+/// top bit). With each coordinate of the query rounded to a signed
+/// `LOW_BITS`-bit weight `w`, the sum of `w` over the row's set bits is
+/// `sum_b 2^b * (popcount(row & pos[b]) - popcount(row & neg[b]))`, where
+/// `pos[b]` / `neg[b]` mark the positive / negative coordinates whose
+/// weight has bit `b` set. That is twelve AND-and-count passes over the
+/// row instead of a table lookup per four coordinates.
+pub(crate) struct LowPlanes {
+    /// Per `LOW_CHUNK` bytes of row: `pos[0..LOW_BITS]` then
+    /// `neg[0..LOW_BITS]`, each `LOW_CHUNK` bytes, zero-padded.
+    masks: Vec<u8>,
+    /// What one unit of weight is worth, times the sign tables' `m`.
+    unit: f32,
+    /// Sum of the signed weights.
+    sum_w: i32,
+    /// Bytes in one bit plane of a low row.
+    row_len: usize,
+}
+
+#[cfg(test)]
+impl LowPlanes {
+    pub(crate) fn masks(&self) -> &[u8] {
+        &self.masks
+    }
+    /// Read by the x86 test that checks the SIMD mask build against the
+    /// scalar one.
+    #[cfg(all(test, target_arch = "x86_64"))]
+    pub(crate) fn sum_w(&self) -> i32 {
+        self.sum_w
+    }
+}
+
+/// [`build_low_planes`] by the coordinate-at-a-time loop alone: every
+/// host without AVX-512, and the reference the x86 build is tested against.
+pub(crate) fn build_low_planes_scalar(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlanes {
+    let n_bytes = dim / 8;
+    let mut masks = vec![0u8; n_bytes.div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK];
+    let top = ((1u32 << LOW_BITS) - 1) as f32;
+    let q_max = q_rot_row[..dim].iter().fold(0.0f32, |a, &q| a.max(q.abs()));
+    let inv = if q_max > 0.0 && q_max.is_finite() { top / q_max } else { 0.0 };
+    let mut sum_w = 0i32;
+    for (i, &q) in q_rot_row[..dim].iter().enumerate() {
+        let w = ((q.abs() * inv + 0.5) as u32).min(top as u32);
+        if w == 0 {
+            continue;
+        }
+        let neg = q < 0.0;
+        sum_w += if neg { -(w as i32) } else { w as i32 };
+        let byte = i / 8;
+        let bit = 0x80u8 >> (i % 8);
+        let base = (byte / LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK
+            + if neg { LOW_BITS * LOW_CHUNK } else { 0 }
+            + byte % LOW_CHUNK;
+        for b in 0..LOW_BITS {
+            if (w >> b) & 1 != 0 {
+                masks[base + b * LOW_CHUNK] |= bit;
+            }
+        }
+    }
+    LowPlanes { masks, unit: if inv > 0.0 { m / inv } else { 0.0 }, sum_w, row_len: n_bytes }
+}
+
+pub(crate) fn build_low_planes(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlanes {
+    // H11 (4-bit round 2): sixteen coordinates at a time where AVX-512 is
+    // there; the coordinate-at-a-time loop was 40 us a query (P4).
+    #[cfg(target_arch = "x86_64")]
+    if dim % 16 == 0
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+    {
+        let n_bytes = dim / 8;
+        let mut masks = vec![0u8; n_bytes.div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK];
+        let top = ((1u32 << LOW_BITS) - 1) as f32;
+        let q_max = q_rot_row[..dim].iter().fold(0.0f32, |a, &q| a.max(q.abs()));
+        let inv = if q_max > 0.0 && q_max.is_finite() { top / q_max } else { 0.0 };
+        // SAFETY: features detected; `masks` holds a full group for every
+        // `LOW_CHUNK` bytes and `dim % 16 == 0` keeps every load in `q`.
+        let sum_w = unsafe { build_low_masks_avx512(&q_rot_row[..dim], inv, top as u32, &mut masks) };
+        return LowPlanes { masks, unit: if inv > 0.0 { m / inv } else { 0.0 }, sum_w, row_len: n_bytes };
+    }
+    build_low_planes_scalar(q_rot_row, m, dim)
+}
+
+/// `REV8[b]` is `b` with its bits reversed: a 16-lane compare mask has
+/// coordinate `i` in bit `i`, a plane byte has it in bit `7 - i`.
+#[cfg(target_arch = "x86_64")]
+const REV8: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        t[b] = (b as u8).reverse_bits();
+        b += 1;
+    }
+    t
+};
+
+/// [`build_low_planes`]'s mask build, sixteen coordinates (two plane
+/// bytes) per step. Returns the sum of the signed weights.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn build_low_masks_avx512(q: &[f32], inv: f32, top: u32, masks: &mut [u8]) -> i32 {
+    use std::arch::x86_64::*;
+    let invv = _mm512_set1_ps(inv);
+    let half = _mm512_set1_ps(0.5);
+    let topv = _mm512_set1_epi32(top as i32);
+    let zero = _mm512_setzero_si512();
+    let zerof = _mm512_setzero_ps();
+    let sign_bit = _mm512_set1_ps(-0.0);
+    let mut sum = _mm512_setzero_si512();
+    let mut c = 0usize;
+    while c * 8 < q.len() {
+        let x = _mm512_loadu_ps(q.as_ptr().add(c * 8));
+        // The scalar build's arithmetic, lane for lane: trunc(|q| * inv + 0.5).
+        let a = _mm512_andnot_ps(sign_bit, x);
+        let w = _mm512_min_epi32(_mm512_cvttps_epi32(_mm512_add_ps(_mm512_mul_ps(a, invv), half)), topv);
+        let neg: __mmask16 = _mm512_cmp_ps_mask(x, zerof, _CMP_LT_OQ);
+        sum = _mm512_add_epi32(sum, _mm512_mask_sub_epi32(w, neg, zero, w));
+        let base = (c / LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK + c % LOW_CHUNK;
+        for b in 0..LOW_BITS {
+            let on: __mmask16 = _mm512_test_epi32_mask(w, _mm512_set1_epi32(1 << b));
+            let pos = (on & !neg) as u16;
+            let ng = (on & neg) as u16;
+            let p = base + b * LOW_CHUNK;
+            let n = base + (LOW_BITS + b) * LOW_CHUNK;
+            *masks.get_unchecked_mut(p) = REV8[(pos & 0xFF) as usize];
+            *masks.get_unchecked_mut(p + 1) = REV8[(pos >> 8) as usize];
+            *masks.get_unchecked_mut(n) = REV8[(ng & 0xFF) as usize];
+            *masks.get_unchecked_mut(n + 1) = REV8[(ng >> 8) as usize];
+        }
+        c += 2;
+    }
+    _mm512_reduce_add_epi32(sum)
+}
+
+/// Sum of the query's signed weights over the set bits of `row`.
+#[inline]
+pub(crate) fn low_dot(planes: &LowPlanes, row: &[u8]) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static POPCNT512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *POPCNT512.get_or_init(|| {
+            std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bw")
+                && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+        }) {
+            // SAFETY: the features were just detected; `masks` holds a full
+            // group for every `LOW_CHUNK` bytes of `row` (`build_low_planes`).
+            return unsafe { low_dot_avx512(&planes.masks, row) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64; `masks` as above.
+        return unsafe { low_dot_neon(&planes.masks, row) };
+    }
+    #[allow(unreachable_code)]
+    low_dot_scalar(&planes.masks, row)
+}
+
+pub(crate) fn low_dot_scalar(masks: &[u8], row: &[u8]) -> i64 {
+    let word = |b: &[u8]| {
+        let mut w = [0u8; 8];
+        w[..b.len()].copy_from_slice(b);
+        u64::from_le_bytes(w)
+    };
+    let mut acc = 0i64;
+    for (c, chunk) in row.chunks(LOW_CHUNK).enumerate() {
+        let group = &masks[c * 2 * LOW_BITS * LOW_CHUNK..(c + 1) * 2 * LOW_BITS * LOW_CHUNK];
+        for (j, bytes) in chunk.chunks(8).enumerate() {
+            let l = word(bytes);
+            for b in 0..LOW_BITS {
+                let p = word(&group[b * LOW_CHUNK + j * 8..][..8]);
+                let n = word(&group[(LOW_BITS + b) * LOW_CHUNK + j * 8..][..8]);
+                acc += ((l & p).count_ones() as i64 - (l & n).count_ones() as i64) << b;
+            }
+        }
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vpopcntdq")]
+unsafe fn low_dot_avx512(masks: &[u8], row: &[u8]) -> i64 {
+    use std::arch::x86_64::*;
+    debug_assert!(masks.len() >= row.len().div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK);
+    let mut acc = _mm512_setzero_si512();
+    let mut mp = masks.as_ptr();
+    let mut off = 0usize;
+    while off < row.len() {
+        let n = (row.len() - off).min(LOW_CHUNK);
+        let live: __mmask64 = if n == LOW_CHUNK { !0 } else { (1u64 << n) - 1 };
+        // A masked load reads only the live bytes, so a short tail does
+        // not run past the row.
+        let l = _mm512_maskz_loadu_epi8(live, row.as_ptr().add(off) as *const i8);
+        for b in 0..LOW_BITS {
+            let pos = _mm512_loadu_si512(mp.add(b * LOW_CHUNK) as *const __m512i);
+            let neg = _mm512_loadu_si512(mp.add((LOW_BITS + b) * LOW_CHUNK) as *const __m512i);
+            let d = _mm512_sub_epi64(
+                _mm512_popcnt_epi64(_mm512_and_si512(l, pos)),
+                _mm512_popcnt_epi64(_mm512_and_si512(l, neg)),
+            );
+            acc = _mm512_add_epi64(acc, _mm512_sll_epi64(d, _mm_cvtsi32_si128(b as i32)));
+        }
+        mp = mp.add(2 * LOW_BITS * LOW_CHUNK);
+        off += LOW_CHUNK;
+    }
+    _mm512_reduce_add_epi64(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn low_dot_neon(masks: &[u8], row: &[u8]) -> i64 {
+    use std::arch::aarch64::*;
+    // The byte accumulators below hold three bits' worth each.
+    const _: () = assert!(LOW_BITS == 6);
+    debug_assert!(masks.len() >= row.len().div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK);
+    let mut acc_lo = vdupq_n_s32(0);
+    let mut acc_hi = vdupq_n_s32(0);
+    for (c, chunk) in row.chunks(LOW_CHUNK).enumerate() {
+        let group = masks.as_ptr().add(c * 2 * LOW_BITS * LOW_CHUNK);
+        let mut j = 0usize;
+        while j < chunk.len() {
+            let l = if chunk.len() - j >= 16 {
+                vld1q_u8(chunk.as_ptr().add(j))
+            } else {
+                let mut t = [0u8; 16];
+                t[..chunk.len() - j].copy_from_slice(&chunk[j..]);
+                vld1q_u8(t.as_ptr())
+            };
+            // Per byte, a plane's difference is in -8..=8; weights 1, 2, 4
+            // keep each accumulator inside an i8.
+            let mut lo = vdupq_n_s8(0);
+            let mut hi = vdupq_n_s8(0);
+            for b in 0..LOW_BITS {
+                let pos = vcntq_u8(vandq_u8(l, vld1q_u8(group.add(b * LOW_CHUNK + j))));
+                let neg = vcntq_u8(vandq_u8(l, vld1q_u8(group.add((LOW_BITS + b) * LOW_CHUNK + j))));
+                let d = vreinterpretq_s8_u8(vsubq_u8(pos, neg));
+                if b < 3 {
+                    lo = vaddq_s8(lo, vshlq_s8(d, vdupq_n_s8(b as i8)));
+                } else {
+                    hi = vaddq_s8(hi, vshlq_s8(d, vdupq_n_s8((b - 3) as i8)));
+                }
+            }
+            acc_lo = vpadalq_s16(acc_lo, vpaddlq_s8(lo));
+            acc_hi = vpadalq_s16(acc_hi, vpaddlq_s8(hi));
+            j += 16;
+        }
+    }
+    vaddlvq_s32(acc_lo) + 8 * vaddlvq_s32(acc_hi)
+}
+
+/// H100: what the refine pass needs to estimate exact scores.
+struct Refine<'a> {
+    low_planes: &'a [LowPlanes],
+    /// Read by the aarch64 table ranking only.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    sign_luts: &'a [QueryNeonLut],
+    bias_corrs: &'a [f32],
+    /// `(c_big + c_small) / 2` and `(c_big - c_small) / 2` over the sign
+    /// tables' magnitude `m`: a 2-bit level is `+-A +- B`, sign bit and
+    /// low bit choosing the signs.
+    a_over_m: f32,
+    /// Per low bit plane, least significant first.
+    b_over_m: [f32; 3],
+    /// Low bit planes per vector (`bits - 1`).
+    n_low: usize,
+    /// The first ranking pass: the sign score and the most significant
+    /// low plane alone. With one low plane it is the whole ranking.
+    a1_over_m: f32,
+    b1_over_m: f32,
+    /// How many of the first pass's best get the remaining planes
+    /// (unused with one low plane).
+    mid_len: usize,
+    t_len: usize,
+}
+
+/// Most candidates ranked together: one pass of the table kernel's 32
+/// lanes.
+const RANK_BATCH: usize = 32;
+
+/// Candidates per ranking step. The table kernel (aarch64, three low
+/// planes) wants its 32 lanes full; the mask count takes one row at a
+/// time, and a short step keeps the prefetch a few rows ahead of it
+/// instead of a burst of 32.
+#[inline]
+fn rank_step(n_low: usize) -> usize {
+    if cfg!(target_arch = "aarch64") && n_low > 1 { RANK_BATCH } else { 8 }
+}
+
+/// Sixteen 16-byte rows -> sixteen columns: `out[j]` holds byte `j` of each
+/// row, in row order.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn transpose16_neon(r: &[std::arch::aarch64::uint8x16_t; 16]) -> [std::arch::aarch64::uint8x16_t; 16] {
+    use std::arch::aarch64::*;
+    let z = vdupq_n_u8(0);
+    // Bytes of row pairs, then of row quads, then of row octets, then all.
+    let (mut a, mut b) = ([z; 8], [z; 8]);
+    for i in 0..8 {
+        a[i] = vzip1q_u8(r[2 * i], r[2 * i + 1]);
+        b[i] = vzip2q_u8(r[2 * i], r[2 * i + 1]);
+    }
+    let mut q = [[z; 4]; 4];
+    for i in 0..4 {
+        let (a0, a1) = (vreinterpretq_u16_u8(a[2 * i]), vreinterpretq_u16_u8(a[2 * i + 1]));
+        let (b0, b1) = (vreinterpretq_u16_u8(b[2 * i]), vreinterpretq_u16_u8(b[2 * i + 1]));
+        q[0][i] = vreinterpretq_u8_u16(vzip1q_u16(a0, a1));
+        q[1][i] = vreinterpretq_u8_u16(vzip2q_u16(a0, a1));
+        q[2][i] = vreinterpretq_u8_u16(vzip1q_u16(b0, b1));
+        q[3][i] = vreinterpretq_u8_u16(vzip2q_u16(b0, b1));
+    }
+    let mut out = [z; 16];
+    for (c, quad) in q.iter().enumerate() {
+        // `quad[i]`: columns 4c..4c+4 of rows 4i..4i+4.
+        let mut o = [[z; 2]; 2];
+        for i in 0..2 {
+            let (x0, x1) = (vreinterpretq_u32_u8(quad[2 * i]), vreinterpretq_u32_u8(quad[2 * i + 1]));
+            o[0][i] = vreinterpretq_u8_u32(vzip1q_u32(x0, x1));
+            o[1][i] = vreinterpretq_u8_u32(vzip2q_u32(x0, x1));
+        }
+        for (h, oct) in o.iter().enumerate() {
+            // `oct[i]`: columns 4c+2h, 4c+2h+1 of rows 8i..8i+8.
+            let (y0, y1) = (vreinterpretq_u64_u8(oct[0]), vreinterpretq_u64_u8(oct[1]));
+            out[4 * c + 2 * h] = vreinterpretq_u8_u64(vzip1q_u64(y0, y1));
+            out[4 * c + 2 * h + 1] = vreinterpretq_u8_u64(vzip2q_u64(y0, y1));
+        }
+    }
+    out
+}
+
+/// For up to 32 rows of `nsg` bytes, the sum over byte positions of the
+/// two nibble lookups in `t` (`nsg * 32` bytes, `[hi16 | lo16]` per
+/// position) — what the sign scan computes for a block, on rows gathered
+/// from anywhere. `rows[i]` is row `i`'s offset in `low`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn table_sums_neon(t: &[u8], low: &[u8], nsg: usize, rows: &[usize], out: &mut [u32; RANK_BATCH]) {
+    use std::arch::aarch64::*;
+    debug_assert!(rows.len() <= RANK_BATCH && t.len() >= nsg * 32);
+    let z = vdupq_n_u8(0);
+    let nib = vdupq_n_u8(0x0F);
+    let mut acc32 = [vdupq_n_u32(0); 8];
+    let mut acc16 = [vdupq_n_u16(0); 4];
+    let mut c = 0usize;
+    while c < nsg {
+        let width = (nsg - c).min(16);
+        let mut r = [[z; 16]; 2];
+        for (i, &off) in rows.iter().enumerate() {
+            r[i / 16][i % 16] = if width == 16 {
+                vld1q_u8(low.as_ptr().add(off + c))
+            } else {
+                let mut tmp = [0u8; 16];
+                tmp[..width].copy_from_slice(&low[off + c..off + c + width]);
+                vld1q_u8(tmp.as_ptr())
+            };
+        }
+        let cols = [transpose16_neon(&r[0]), transpose16_neon(&r[1])];
+        for j in 0..width {
+            let tp = t.as_ptr().add((c + j) * 32);
+            let (thi, tlo) = (vld1q_u8(tp), vld1q_u8(tp.add(16)));
+            for (h, col) in cols.iter().enumerate() {
+                let x = col[j];
+                // Each entry is at most 127, so the pair fits a byte.
+                let sum = vaddq_u8(vqtbl1q_u8(thi, vshrq_n_u8(x, 4)), vqtbl1q_u8(tlo, vandq_u8(x, nib)));
+                acc16[2 * h] = vaddw_u8(acc16[2 * h], vget_low_u8(sum));
+                acc16[2 * h + 1] = vaddw_high_u8(acc16[2 * h + 1], sum);
+            }
+        }
+        c += 16;
+        // 16 positions add at most 16 * 254 to a u16 lane: widen every 256
+        // positions, and at the end.
+        if c % 256 == 0 || c >= nsg {
+            for (k, a) in acc16.iter_mut().enumerate() {
+                acc32[2 * k] = vaddw_u16(acc32[2 * k], vget_low_u16(*a));
+                acc32[2 * k + 1] = vaddw_high_u16(acc32[2 * k + 1], *a);
+                *a = vdupq_n_u16(0);
+            }
+        }
+    }
+    for (k, a) in acc32.iter().enumerate() {
+        vst1q_u32(out.as_mut_ptr().add(4 * k), *a);
+    }
+}
+
+/// `m * sum(+-q)` over one low bit plane (`plane`, least significant
+/// first) for each of `vs` (at most [`RANK_BATCH`]): a set bit counts its
+/// coordinate, a clear one its negative.
+#[inline]
+fn plane_terms(r: &Refine<'_>, qi: usize, low: &[u8], vs: &[usize], plane: usize, out: &mut [f32; RANK_BATCH]) {
+    debug_assert!(vs.len() <= RANK_BATCH);
+    #[cfg(target_arch = "aarch64")]
+    if r.n_low > 1 {
+        // NEON counts bits a byte at a time, which makes the mask count
+        // ~70 ns a plane; the scan's own table kernel on 32 gathered rows
+        // is several times cheaper. (2 bits keeps the mask count it was
+        // gated with.)
+        let lut = &r.sign_luts[qi];
+        let nsg = lut.uint8_luts.len() / 32;
+        let mut rows = [0usize; RANK_BATCH];
+        for (o, &v) in rows.iter_mut().zip(vs) {
+            *o = (v * r.n_low + plane) * nsg;
+        }
+        let mut sums = [0u32; RANK_BATCH];
+        // SAFETY: NEON is baseline; every row is `nsg` bytes inside `low`
+        // for `v < n_vectors`, and the table holds 32 bytes per position.
+        unsafe { table_sums_neon(&lut.uint8_luts, low, nsg, &rows[..vs.len()], &mut sums) };
+        // The table sum, undone to `m * sum(+-q)` (its bias carries the
+        // query's TQ+ correction, which is not part of this plane).
+        let b = lut.bias - r.bias_corrs[qi];
+        for (o, &u) in out.iter_mut().zip(&sums).take(vs.len()) {
+            *o = lut.scale * u as f32 + b;
+        }
+        return;
+    }
+    {
+        let planes = &r.low_planes[qi];
+        let nsg = planes.row_len;
+        for (o, &v) in out.iter_mut().zip(vs) {
+            let row = &low[(v * r.n_low + plane) * nsg..(v * r.n_low + plane + 1) * nsg];
+            *o = planes.unit * (2 * low_dot(planes, row) - planes.sum_w as i64) as f32;
+        }
+    }
+}
+
+/// H100, first ranking pass: each candidate's sign-plane score becomes an
+/// estimate of its exact score from the sign plane and the top low plane
+/// (the only one at 2 bits), reweighted to the levels' `alpha1` / `beta1`.
+fn rank_first(r: &Refine<'_>, qi: usize, low: &[u8], nsg: usize, cands: &mut [(usize, f32)], vec_scales: &[f32]) {
+    rank_first_keep(r, qi, low, nsg, cands, vec_scales, None);
+}
+
+/// [`rank_first`], also handing back each candidate's top-plane term
+/// (H17: the second pass then reads two planes instead of three).
+fn rank_first_keep(
+    r: &Refine<'_>,
+    qi: usize,
+    low: &[u8],
+    nsg: usize,
+    cands: &mut [(usize, f32)],
+    vec_scales: &[f32],
+    mut tops: Option<&mut [f32]>,
+) {
+    let top = r.n_low - 1;
+    let bc = r.bias_corrs[qi];
+    let mut vs = [0usize; RANK_BATCH];
+    let mut m_l = [0.0f32; RANK_BATCH];
+    let n = cands.len();
+    let step = rank_step(r.n_low);
+    for start in (0..n).step_by(step) {
+        let end = (start + step).min(n);
+        for c in &cands[end..(end + step).min(n)] {
+            prefetch_low(low, nsg, c.0 * r.n_low + top, 1);
+        }
+        for (o, c) in vs.iter_mut().zip(&cands[start..end]) {
+            *o = c.0;
+        }
+        plane_terms(r, qi, low, &vs[..end - start], top, &mut m_l);
+        if let Some(t) = tops.as_deref_mut() {
+            t[start..end].copy_from_slice(&m_l[..end - start]);
+        }
+        for (c, &l) in cands[start..end].iter_mut().zip(&m_l) {
+            let vscale = vec_scales[c.0];
+            c.1 = if vscale == 0.0 {
+                0.0
+            } else {
+                let m_s = c.1 / vscale - bc;
+                vscale * (r.a1_over_m * m_s + r.b1_over_m * l + bc)
+            };
+        }
+    }
+}
+
+/// Second ranking pass (three low planes): the full bit model for
+/// candidates the first pass scored. The sign plane's sum is recovered
+/// from that score rather than carried alongside it. With each
+/// candidate's top-plane term already known from the first pass (`tops`,
+/// aligned with `cands`) it reads two planes, not three.
+fn rank_full_known(
+    r: &Refine<'_>,
+    qi: usize,
+    low: &[u8],
+    nsg: usize,
+    cands: &mut [(usize, f32)],
+    vec_scales: &[f32],
+    tops: Option<&[f32]>,
+) {
+    let bc = r.bias_corrs[qi];
+    let mut vs = [0usize; RANK_BATCH];
+    let mut m_l = [[0.0f32; RANK_BATCH]; 3];
+    let n = cands.len();
+    let step = rank_step(r.n_low);
+    let planes_to_read = if tops.is_some() { r.n_low - 1 } else { r.n_low };
+    for start in (0..n).step_by(step) {
+        let end = (start + step).min(n);
+        for c in &cands[end..(end + step).min(n)] {
+            prefetch_low(low, nsg, c.0 * r.n_low, planes_to_read);
+        }
+        for (o, c) in vs.iter_mut().zip(&cands[start..end]) {
+            *o = c.0;
+        }
+        for (j, l) in m_l.iter_mut().enumerate().take(planes_to_read) {
+            plane_terms(r, qi, low, &vs[..end - start], j, l);
+        }
+        if let Some(t) = tops {
+            m_l[r.n_low - 1][..end - start].copy_from_slice(&t[start..end]);
+        }
+        for (i, c) in cands[start..end].iter_mut().enumerate() {
+            let vscale = vec_scales[c.0];
+            c.1 = if vscale == 0.0 {
+                0.0
+            } else {
+                let m_s = ((c.1 / vscale - bc) - r.b1_over_m * m_l[r.n_low - 1][i]) / r.a1_over_m;
+                let mut est = r.a_over_m * m_s;
+                for (j, l) in m_l.iter().enumerate().take(r.n_low) {
+                    est += r.b_over_m[j] * l[i];
+                }
+                vscale * (est + bc)
+            };
+        }
+    }
+}
+
+/// H99: whether the kernels that will scan these tables implement the
+/// buffered collector ([`HEAP_BUFFERED`]).
+fn planes_buffered_supported(sign_luts: &[QueryNeonLut]) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = sign_luts;
+        true
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        sign_luts.first().is_some_and(|l| !l.split.is_empty())
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = sign_luts;
+        false
+    }
+}
+
+/// `f32::round` (half away from zero) without the libm call x86 makes for
+/// it, and without a branch: `x - trunc(x)` is exact in f32, so comparing
+/// the fraction against one half reproduces `round` on every input
+/// (H65), and the two comparisons add as integers instead of selecting a
+/// path, which is what lets the caller's loop vectorise (H108). aarch64
+/// has `frinta` for `round` itself.
+#[inline(always)]
+fn round_half_away_f32(x: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return x.round();
+    }
+    #[allow(unreachable_code)]
+    {
+        let t = x.trunc();
+        let f = x - t;
+        t + ((f >= 0.5) as i32 - (f <= -0.5) as i32) as f32
+    }
+}
+
+/// Quantise sub-tables of sixteen f32 entries to u8:
+/// `round((v - min) * inv_scale)` clamped to `0..=max_lut`.
+///
+/// Byte-for-byte what `round(..).clamp(0.0, max_lut) as u8` produced:
+/// `max(0.0)` maps a NaN to 0 as the saturating cast did, and after
+/// `min(max_lut)` the value is in range, so the unchecked narrowing is the
+/// same conversion without the saturation logic that kept the loop scalar.
+#[inline]
+fn quantise_tables(float_vals: &[f32], mins: &[f32], inv_scale: f32, max_lut: f32, out: &mut [u8]) {
+    debug_assert!((0.0..=255.0).contains(&max_lut));
+    for ((chunk, o), &m) in float_vals.chunks_exact(16).zip(out.chunks_exact_mut(16)).zip(mins) {
+        for (o, &v) in o.iter_mut().zip(chunk) {
+            let r = round_half_away_f32((v - m) * inv_scale).max(0.0).min(max_lut);
+            // SAFETY: `r` is in `0.0..=max_lut <= 255.0` and not NaN.
+            *o = unsafe { r.to_int_unchecked::<u8>() };
+        }
+    }
+}
+
+/// H102: largest entry of a sign table read by the deferred-widening
+/// aarch64 kernel.
+const SIGN_LUT_CAP_NEON: f32 = 31.0;
+
+/// H99: per-query nibble LUTs over a sign plane. Byte-group `g` covers dims
+/// `8g..8g+8`; the high nibble indexes the first sub-table (dims `8g..8g+4`,
+/// first dim in the top bit), the low nibble the second. Entry `p` is
+/// `sum_j (+-m) * q[d + j]`, quantised to u8 exactly as the 2-bit tables
+/// are, so every kernel that scores those scores these.
+pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize, deferred: bool) -> QueryNeonLut {
+    let n_groups = dim / 8;
+    let mut float_vals = vec![0.0f32; n_groups * 32];
+    let mut uint8_luts = vec![0u8; n_groups * 32];
+    let mut mins = vec![0.0f32; n_groups * 2];
+    let mut max_span = 0.0f32;
+    let mut bias = 0.0f32;
+    for g in 0..n_groups {
+        for half in 0..2 {
+            let d = g * 8 + half * 4;
+            let p = [q_rot_row[d] * m, q_rot_row[d + 1] * m, q_rot_row[d + 2] * m, q_rot_row[d + 3] * m];
+            let out = &mut float_vals[g * 32 + half * 16..g * 32 + half * 16 + 16];
+            // H104: a pattern is a pair of dims' signs twice over, so the
+            // 16 entries are 4 + 4 pair sums added crosswise, and their
+            // min and max are the pairs' — no pass over the 16.
+            let a = [-p[0] - p[1], p[1] - p[0], p[0] - p[1], p[0] + p[1]];
+            let b = [-p[2] - p[3], p[3] - p[2], p[2] - p[3], p[2] + p[3]];
+            for (pat, o) in out.iter_mut().enumerate() {
+                *o = a[pat >> 2] + b[pat & 3];
+            }
+            let (m01, m23) = (p[0].abs() + p[1].abs(), p[2].abs() + p[3].abs());
+            let mn = -m01 - m23;
+            let mx = m01 + m23;
+            mins[g * 2 + half] = mn;
+            bias += mn;
+            if mx - mn > max_span {
+                max_span = mx - mn;
+            }
+        }
+    }
+    // H102: one query on aarch64 scans with a kernel that adds eight
+    // lookups in u8 before widening, so its entries are capped at 31
+    // (8 * 31 = 248). The sign score only ranks a shortlist, and its
+    // distance from the exact score is far larger than this rounding.
+    // Batches keep the 7-bit table: their kernel does not defer (see
+    // `score_sign_block_neon`), and the refine pass reads these tables.
+    let max_lut: f32 = if deferred { SIGN_LUT_CAP_NEON } else { 127.0 };
+    let scale = if max_span > 0.0 { max_span / max_lut } else { 1.0 };
+    let (scale, inv_scale) = if scale >= f32::MIN_POSITIVE { (scale, 1.0 / scale) } else { (1.0, 1.0) };
+    quantise_tables(&float_vals, &mins, inv_scale, max_lut, &mut uint8_luts);
+    QueryNeonLut {
+        #[cfg(target_arch = "x86_64")]
+        split: if crate::pack::vector_major_for(2, n_groups) {
+            AlignedBytes::from_slice(&split_lut_for_vnni(&uint8_luts, n_groups))
+        } else {
+            AlignedBytes::default()
+        },
+        #[cfg(target_arch = "aarch64")]
+        pd2: None,
+        pd: None,
+        uint8_luts,
+        scale,
+        bias,
+    }
+}
+
+/// Hint that the cache line at `p` is about to be read.
+#[inline(always)]
+fn prefetch_read(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch does not fault and reads nothing architecturally.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above; `prfm` is a hint.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
+/// Prefetch `planes` consecutive bit planes of the low region, starting at
+/// plane index `first` (counted across vectors), a cache line at a time.
+#[inline]
+fn prefetch_low(low: &[u8], nsg: usize, first: usize, planes: usize) {
+    let (start, len) = (first * nsg, planes * nsg);
+    let mut off = 0;
+    while off < len && start + off < low.len() {
+        prefetch_read(low[start + off..].as_ptr());
+        off += 64;
+    }
+    // The span rarely starts on a line boundary: cover its last byte too.
+    if len > 0 && start + len - 1 < low.len() {
+        prefetch_read(low[start + len - 1..].as_ptr());
+    }
+}
+
+/// H110: prefetch what [`legacy_score`] (and, with `sign_too == false`,
+/// what the first ranking pass) will read for vector `v`. A rescore reads one
+/// byte per byte-group out of a 3 KB sign block — a cache line per four
+/// groups on x86, per two on aarch64 — so its cost is the misses, and
+/// issuing them for a few candidates ahead lets them overlap.
+#[inline]
+fn prefetch_candidate(sign: &[u8], low: &[u8], nsg: usize, n_low: usize, v: usize, sign_too: bool) {
+    if n_low == 1 {
+        let row = v * nsg;
+        if row < low.len() {
+            prefetch_read(low[row..].as_ptr());
+            if nsg > 64 && row + 64 < low.len() {
+                prefetch_read(low[row + 64..].as_ptr());
+            }
+        }
+    } else if sign_too {
+        // The exact rescore reads every plane.
+        prefetch_low(low, nsg, v * n_low, n_low);
+    } else {
+        // The first ranking pass reads the top plane alone; fetching the
+        // other two for a candidate that pass will drop triples the
+        // traffic for nothing.
+        prefetch_low(low, nsg, v * n_low + n_low - 1, 1);
+    }
+    if sign_too {
+        let base = (v / BLOCK) * nsg * BLOCK;
+        let step = if cfg!(target_arch = "x86_64") { 4 } else { 2 };
+        let mut g = 0;
+        while g < nsg {
+            let off = base + crate::pack::planes_slot(g, v % BLOCK);
+            if off < sign.len() {
+                prefetch_read(sign[off..].as_ptr());
+            }
+            g += step;
+        }
+    }
+}
+
+/// H99: one vector's exact 2-bit score from a planes cache.
+///
+/// Rebuilds the dim-major code bytes from the two planes and sums the same
+/// u8 table entries the exact kernels sum, then applies their float
+/// epilogue in their order — one multiply-add over the whole sum on x86
+/// (the `vpermb` scan), a fused multiply-add per `FLUSH_EVERY` groups on
+/// aarch64 — so the result is the exact scan's score bit for bit.
+#[inline]
+fn legacy_score(
+    lut: &QueryNeonLut,
+    sign: &[u8],
+    low: &[u8],
+    n_byte_groups: usize,
+    v: usize,
+    vscale: f32,
+) -> f32 {
+    let nsg = n_byte_groups / 2;
+    let lane = v % BLOCK;
+    // The three slices carry every bound the loop needs, so the loop
+    // itself indexes unchecked (H111: checked, it ran at ~17 cycles a
+    // byte-group and the rescore was compute-bound, not miss-bound).
+    let blk = &sign[(v / BLOCK) * nsg * BLOCK..][..nsg * BLOCK];
+    let low = &low[v * nsg..(v + 1) * nsg];
+    let t = &lut.uint8_luts[..n_byte_groups * 32];
+    let comb = &crate::pack::PLANES_COMB;
+    let mut sum: u32 = 0;
+    #[cfg(target_arch = "aarch64")]
+    let mut fa = lut.bias;
+    for g in 0..nsg {
+        // SAFETY: `planes_slot(g, lane) < nsg * BLOCK` for `g < nsg`,
+        // `lane < BLOCK`; `g < nsg == low.len()`; and each table index is
+        // at most `g * 64 + 63 < nsg * 64 == t.len()`.
+        let (sb, lb) = unsafe {
+            (*blk.get_unchecked(crate::pack::planes_slot(g, lane)), *low.get_unchecked(g))
+        };
+        let c0 = comb[((sb & 0xF0) | (lb >> 4)) as usize];
+        let c1 = comb[(((sb & 15) << 4) | (lb & 15)) as usize];
+        let o = g * 64;
+        sum += unsafe {
+            *t.get_unchecked(o + (c0 >> 4) as usize) as u32
+                + *t.get_unchecked(o + 16 + (c0 & 15) as usize) as u32
+                + *t.get_unchecked(o + 32 + (c1 >> 4) as usize) as u32
+                + *t.get_unchecked(o + 48 + (c1 & 15) as usize) as u32
+        };
+        #[cfg(target_arch = "aarch64")]
+        if (2 * g + 2) % FLUSH_EVERY == 0 {
+            fa = lut.scale.mul_add(sum as f32, fa);
+            sum = 0;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if n_byte_groups % FLUSH_EVERY != 0 {
+            fa = lut.scale.mul_add(sum as f32, fa);
+        }
+        fa * vscale
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        ((sum as f32) * lut.scale + lut.bias) * vscale
+    }
+}
+
+/// One query's operands for the exact 4-bit rescore of a planes cache:
+/// the permute-dot kernels' int8 weights and levels, with the weights laid
+/// out the way a bit plane is read — position `8c + b` is bit `b` of byte
+/// `c`, which is dim `8c + 7 - b` — and zero-padded to whole 64s.
+pub(crate) struct Exact4 {
+    w: Vec<i8>,
+    levels: [i8; 16],
+    /// Cancels the +128 the AVX-512 path biases `levels` by.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    zero: i32,
+    scale: f32,
+    bias: f32,
+}
+
+impl Exact4 {
+    pub(crate) fn new(pd: &QueryPermuteDot, dim: usize) -> Self {
+        let mut w = vec![0i8; dim.div_ceil(64) * 64];
+        for d in 0..dim {
+            // `QueryPermuteDot::weights`: per four byte-groups, the four
+            // odd dims then the four even ones.
+            let g = d / 2;
+            let src = (g / 4) * 8 + g % 4 + if d % 2 == 0 { 4 } else { 0 };
+            w[(d / 8) * 8 + 7 - d % 8] = pd.weights[src];
+        }
+        Exact4 { w, levels: pd.levels, zero: pd.zero, scale: pd.scale, bias: pd.bias }
+    }
+}
+
+/// `SPREAD8[b]`: byte `i` of the result is bit `i` of `b`.
+const SPREAD8: [u64; 256] = {
+    let mut t = [0u64; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut i = 0;
+        while i < 8 {
+            t[b] |= (((b >> i) & 1) as u64) << (8 * i);
+            i += 1;
+        }
+        b += 1;
+    }
+    t
+};
+
+/// The eight 4-bit codes one byte of each plane covers, one per byte,
+/// in bit order.
+#[inline(always)]
+fn exact4_codes(sb: u8, p2: u8, p1: u8, p0: u8) -> u64 {
+    (SPREAD8[sb as usize] << 3)
+        | (SPREAD8[p2 as usize] << 2)
+        | (SPREAD8[p1 as usize] << 1)
+        | SPREAD8[p0 as usize]
+}
+
+/// `sum_d weight[d] * level[code[d]]` for vector `v` — the integer the
+/// permute-dot kernels accumulate. Portable reference.
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn exact4_sum_scalar(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize) -> i32 {
+    let blk = &sign[(v / BLOCK) * nsg * BLOCK..][..nsg * BLOCK];
+    let row = &low[v * 3 * nsg..(v + 1) * 3 * nsg];
+    let lane = v % BLOCK;
+    let mut sum = 0i32;
+    for c in 0..nsg {
+        let codes = exact4_codes(
+            blk[crate::pack::planes_slot(c, lane)], row[2 * nsg + c], row[nsg + c], row[c],
+        );
+        for b in 0..8 {
+            sum += e.w[c * 8 + b] as i32 * e.levels[((codes >> (8 * b)) & 15) as usize] as i32;
+        }
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn exact4_sum_neon(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize) -> i32 {
+    use std::arch::aarch64::*;
+    let blk = &sign[(v / BLOCK) * nsg * BLOCK..][..nsg * BLOCK];
+    let row = &low[v * 3 * nsg..(v + 1) * 3 * nsg];
+    let lane = v % BLOCK;
+    let levels = vld1q_s8(e.levels.as_ptr());
+    let mut acc = vdupq_n_s32(0);
+    let mut c = 0usize;
+    // `nsg` is a multiple of four (`planes_for`), so it splits into pairs.
+    while c + 2 <= nsg {
+        let mut codes = [0u64; 2];
+        for (i, code) in codes.iter_mut().enumerate() {
+            let g = c + i;
+            // SAFETY: `g < nsg`; the slot is inside the block and the three
+            // plane bytes inside the row.
+            *code = exact4_codes(
+                *blk.get_unchecked(g * BLOCK + lane),
+                *row.get_unchecked(2 * nsg + g),
+                *row.get_unchecked(nsg + g),
+                *row.get_unchecked(g),
+            );
+        }
+        let lv = vqtbl1q_s8(levels, vreinterpretq_u8_u64(vld1q_u64(codes.as_ptr())));
+        let w = vld1q_s8(e.w.as_ptr().add(c * 8));
+        acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(lv), vget_low_s8(w)));
+        acc = vpadalq_s16(acc, vmull_high_s8(lv, w));
+        c += 2;
+    }
+    vaddvq_s32(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn exact4_sum_avx512(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize) -> i32 {
+    use std::arch::x86_64::*;
+    let blk = sign.as_ptr().add((v / BLOCK) * nsg * BLOCK);
+    let row = low.as_ptr().add(v * 3 * nsg);
+    let lane = v % BLOCK;
+    // A lane's four bytes of one quad of sign groups are contiguous.
+    let quad = |q: usize| -> u32 {
+        (blk.add(q * 128 + (lane / 16) * 64 + (lane % 16) * 4) as *const u32).read_unaligned()
+    };
+    let levels = _mm512_xor_si512(
+        _mm512_broadcast_i32x4(_mm_loadu_si128(e.levels.as_ptr() as *const __m128i)),
+        _mm512_set1_epi8(-128),
+    );
+    let (b8, b4, b2, b1) =
+        (_mm512_set1_epi8(8), _mm512_set1_epi8(4), _mm512_set1_epi8(2), _mm512_set1_epi8(1));
+    let mut acc = _mm512_setzero_si512();
+    let mut c = 0usize;
+    while c < nsg {
+        // Eight bytes of each plane, or the last four.
+        let wide = c + 8 <= nsg;
+        let rd = |p: *const u8| -> u64 {
+            if wide { (p as *const u64).read_unaligned() } else { (p as *const u32).read_unaligned() as u64 }
+        };
+        let ks = if wide { quad(c / 4) as u64 | ((quad(c / 4 + 1) as u64) << 32) } else { quad(c / 4) as u64 };
+        let (k2, k1, k0) = (rd(row.add(2 * nsg + c)), rd(row.add(nsg + c)), rd(row.add(c)));
+        let codes = _mm512_or_si512(
+            _mm512_or_si512(_mm512_maskz_mov_epi8(ks, b8), _mm512_maskz_mov_epi8(k2, b4)),
+            _mm512_or_si512(_mm512_maskz_mov_epi8(k1, b2), _mm512_maskz_mov_epi8(k0, b1)),
+        );
+        // `levels` is biased into unsigned range for `vpdpbusd`; `zero`
+        // takes the bias back out. Padding weights are zero.
+        let lv = _mm512_shuffle_epi8(levels, codes);
+        let w = _mm512_loadu_si512(e.w.as_ptr().add(c * 8) as *const __m512i);
+        acc = _mm512_dpbusd_epi32(acc, lv, w);
+        c += 8;
+    }
+    _mm512_reduce_add_epi32(acc).wrapping_add(e.zero)
+}
+
+/// This host's kernel for the exact 4-bit sum.
+#[inline]
+pub(crate) fn exact4_sum(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a 4-bit planes cache exists only where the vector-major
+    // kernels do (`pack::planes_for`), which need these features; the
+    // block and row are in bounds for `v < n_vectors`, and `w` is padded.
+    return unsafe { exact4_sum_avx512(e, sign, low, nsg, v) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline; bounds as above.
+    return unsafe { exact4_sum_neon(e, sign, low, nsg, v) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    exact4_sum_scalar(e, sign, low, nsg, v)
+}
+
+/// One vector's exact 4-bit score from a planes cache: the permute-dot
+/// kernels' integer sum, then their float epilogue (one fused
+/// multiply-add, times the vector's scale), so the score is bit-identical
+/// to the exact scan's.
+#[inline]
+fn exact4_score(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize, vscale: f32) -> f32 {
+    let sum = exact4_sum(e, sign, low, nsg, v);
+    (sum as f32).mul_add(e.scale, e.bias) * vscale
+}
+
+/// H6 (1-bit climb): the least work — candidates times sign-row bytes —
+/// for which one query spreads its second ranking pass across the pool.
+/// H9 set the bar at 320 candidates, measured at d = 1536 (192 bytes a
+/// row); counted in candidates it held at every dimension, and at d = 768
+/// the pass ran 5x slower on the pool than on the calling thread (44.8 us
+/// against 9.0 at k = 64): waking the parked workers cost more than the
+/// work. Counted in work it is unchanged at d = 1536.
+const STAGE2_POOL_WORK: usize = 320 * 192;
+
+/// H6: the same for the exact rescore, whose bar was 64 candidates at
+/// d = 1536. At d = 768, 64 candidates took 38 us on the pool and 8 us on
+/// the calling thread.
+const RESCORE_POOL_WORK: usize = 64 * 192;
+
+/// H99: rescore each query's candidates exactly and keep its top `k`, in
+/// the scan's own (score desc, index asc) order.
+#[allow(clippy::too_many_arguments)]
+fn rerank_legacy(
+    query_luts: &[QueryNeonLut],
+    exact4: Option<&[Exact4]>,
+    ids: &[Vec<(usize, f32)>],
+    refine: Option<&Refine<'_>>,
+    first_done: bool,
+    nq: usize,
+    sign: &[u8],
+    low: &[u8],
+    vec_scales: &[f32],
+    nsg: usize,
+    n_low: usize,
+    k: usize,
+) -> (Vec<f32>, Vec<i64>) {
+    let per: Vec<Vec<(f32, i64)>> = (0..nq)
+        .into_par_iter()
+        .map(|qi| {
+            const AHEAD: usize = 4;
+            // 2 bits: the exact scan's table sums. 4 bits: its integer dot
+            // product.
+            let exact = |v: usize| -> f32 {
+                match exact4 {
+                    Some(e) => exact4_score(&e[qi], sign, low, nsg, v, vec_scales[v]),
+                    None => legacy_score(&query_luts[qi], sign, low, 2 * nsg, v, vec_scales[v]),
+                }
+            };
+            let score_ids = |c: &[(usize, f32)]| -> Vec<(f32, i64)> {
+                for &(v, _) in c.iter().take(AHEAD) {
+                    prefetch_candidate(sign, low, nsg, n_low, v, true);
+                }
+                c.iter()
+                    .enumerate()
+                    .map(|(j, &(v, _))| {
+                        if let Some(&(nv, _)) = c.get(j + AHEAD) {
+                            prefetch_candidate(sign, low, nsg, n_low, nv, true);
+                        }
+                        (exact(v), v as i64)
+                    })
+                    .collect()
+            };
+            let one_query_par = nq == 1 && rayon::current_num_threads() > 1;
+            // H100: rank the shortlist by the refined estimate and keep
+            // only its best `t_len` for the exact rescore.
+            let narrowed: Vec<(usize, f32)>;
+            let list: &[(usize, f32)] = match refine {
+                Some(r) if ids[qi].len() > r.t_len => {
+                    let by_score = |a: &(usize, f32), b: &(usize, f32)| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    };
+                    // First pass (unless the scan's workers already ran
+                    // it): the sign score plus the top low plane.
+                    let mut est: Vec<(usize, f32)> = ids[qi].clone();
+                    // H17: the first pass's top-plane terms ride along so
+                    // the second pass reads two planes, not three.
+                    let mut tops: Vec<f32> = Vec::new();
+                    if !first_done {
+                        tops = vec![0.0; est.len()];
+                        rank_first_keep(r, qi, low, nsg, &mut est, vec_scales, Some(&mut tops));
+                    }
+                    // Second pass, three low planes only: the remaining
+                    // planes for the first pass's best.
+                    if n_low > 1 {
+                        if est.len() > r.mid_len {
+                            if tops.is_empty() {
+                                est.select_nth_unstable_by(r.mid_len - 1, by_score);
+                                est.truncate(r.mid_len);
+                            } else {
+                                let mut both: Vec<((usize, f32), f32)> =
+                                    est.iter().copied().zip(tops.iter().copied()).collect();
+                                both.select_nth_unstable_by(r.mid_len - 1, |a, b| by_score(&a.0, &b.0));
+                                both.truncate(r.mid_len);
+                                est = both.iter().map(|b| b.0).collect();
+                                tops = both.iter().map(|b| b.1).collect();
+                            }
+                        }
+                        // H9 (4-bit round 2): one query on a pool spreads
+                        // the second pass across the workers, as the exact
+                        // rescore below does.
+                        if one_query_par && est.len() * nsg >= STAGE2_POOL_WORK {
+                            let chunk = est.len().div_ceil(rayon::current_num_threads());
+                            let known = (!tops.is_empty()).then_some(tops.as_slice());
+                            let parts = pool_map_spin(est.len().div_ceil(chunk), None, None, &|ci: usize| {
+                                let (a, b) = (ci * chunk, ((ci + 1) * chunk).min(est.len()));
+                                let mut part = est[a..b].to_vec();
+                                rank_full_known(r, qi, low, nsg, &mut part, vec_scales, known.map(|t| &t[a..b]));
+                                part
+                            });
+                            est = parts.into_iter().flatten().collect();
+                        } else {
+                            let known = (!tops.is_empty()).then_some(tops.as_slice());
+                            rank_full_known(r, qi, low, nsg, &mut est, vec_scales, known);
+                        }
+                    }
+                    if est.len() > r.t_len {
+                        est.select_nth_unstable_by(r.t_len - 1, by_score);
+                        est.truncate(r.t_len);
+                    }
+                    narrowed = est;
+                    &narrowed
+                }
+                _ => &ids[qi],
+            };
+            // One query has no query axis to spread over, so its shortlist
+            // is the parallel axis instead.
+            let mut cands: Vec<(f32, i64)> = if one_query_par && list.len() * nsg >= RESCORE_POOL_WORK {
+                let chunk = list.len().div_ceil(rayon::current_num_threads());
+                pool_map_spin(list.len().div_ceil(chunk), None, None, &|ci: usize| {
+                    score_ids(&list[ci * chunk..((ci + 1) * chunk).min(list.len())])
+                })
+                .into_iter()
+                .flatten()
+                .collect()
+            } else {
+                score_ids(list)
+            };
+            cands.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            cands.truncate(k);
+            cands
+        })
+        .collect();
+    let mut all_scores = Vec::with_capacity(nq * k);
+    let mut all_indices = Vec::with_capacity(nq * k);
+    for c in &per {
+        let pad = k.saturating_sub(c.len());
+        all_scores.extend(c.iter().map(|p| p.0));
+        all_scores.extend(std::iter::repeat(f32::NEG_INFINITY).take(pad));
+        all_indices.extend(c.iter().map(|p| p.1));
+        all_indices.extend(std::iter::repeat(0i64).take(pad));
+    }
+    (all_scores, all_indices)
+}
+
+/// Scoring + top-k over prepared per-query tables: everything in [`search`]
+/// after the query prep. `n_byte_groups` describes `blocked_codes`, so the
+/// same scan serves the full codes and the H99 sign plane.
+///
+/// Only the classic NEON kernels and the x86 `vpermb` scan honour a
+/// `block_bytes` wider than `n_byte_groups * BLOCK`; `pack::planes_for`
+/// selects the plane layout only where those are the kernels in use.
+#[allow(clippy::too_many_arguments)]
+fn scan_with_luts(
+    query_luts: &[QueryNeonLut],
+    nq: usize,
+    blocked_codes: &[u8],
+    vec_scales: &[f32],
+    bits: usize,
+    n_byte_groups: usize,
+    // Bytes from one block to the next. `n_byte_groups * BLOCK` except for
+    // an H99 sign-plane scan, which reads the first half of each block.
+    block_bytes: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    buffered: bool,
+    // Per-query starting thresholds for a buffered scan.
+    seed: Option<&[f32]>,
+    // H105/H106: hooks for a single-query parallel scan. Not run on any
+    // other path.
+    hooks: SingleHooks<'_>,
+) -> (Vec<f32>, Vec<i64>) {
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = (buffered, seed, hooks);
+    let seed_of = |qi: usize| seed.map_or(f32::NEG_INFINITY, |s| s[qi]);
+    // On aarch64 a collector scan's block-range cap follows the caller's k
+    // (a collector's capacity is 2S = 25.6 k), which gives the batched scan
+    // seven block ranges instead of two and an even last wave (P47). x86
+    // keeps the coarser split it has always preferred (H6, H101, H107).
+    let k_cap = if buffered && cfg!(target_arch = "aarch64") {
+        if hooks.k_hint > 0 { hooks.k_hint } else { (k / 25).max(1) }
+    } else {
+        k
+    };
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = k_cap;
     // Platform-specific scoring + top-k
+    // Single-query fast path (aarch64) — mirror of the x86 version: one
+    // query on a large index partitions the block range across pool
+    // workers; each range scores blocks with the single-query NEON
+    // kernel straight into a local top-k (no full scores row), then
+    // ranges merge deterministically.
+    //
+    // A mask rides along by slicing the bitmap at the range's first
+    // word: `blocks_per_range` is rounded to an even number of 32-vector
+    // blocks so every range starts on a 64-slot boundary, which is
+    // exactly one `u64` word. The slice is then indexed range-relative
+    // like the codes and scales.
+    /// One rayon range's worth of blocks, scored straight into a local
+    /// top-k. `MASKED` is a const parameter rather than a runtime check
+    /// so the unmasked instantiation carries no mask code at all.
+    /// Indices are range-relative; the caller rebases them.
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_range_neon<const MASKED: bool>(
+        codes: &[u8],
+        lut: &QueryNeonLut,
+        n_byte_groups: usize,
+        scales_slice: &[f32],
+        block_bytes: usize,
+        range_blocks: usize,
+        range_vecs: usize,
+        k: usize,
+        mask: Option<&[u64]>,
+        buffered: bool,
+        heap_min0: f32,
+    ) -> Vec<(f32, u64)> {
+        let mut heap: Vec<(f32, u64)> = Vec::with_capacity(k);
+        let mut heap_min = heap_min0;
+        let mut heap_mi = 0usize;
+        // One row, so the single-query and 4-query permute-dot kernels can
+        // share a signature.
+        let mut out = [[0.0f32; BLOCK]; 1];
+        // Built once per scan, not per block: the reshape is O(dim) while the
+        // loop below is O(n_blocks * dim). `None` means this index is not in
+        // the vm8 layout, so the classic kernel applies.
+        let vm8_single: Option<Vec<i8>> = lut.pd.as_ref().and_then(|pd| {
+            // `pd` is built only at 4 bits, which is the width this helper
+            // sees; `bits` is not in scope in this nested fn.
+            crate::pack::vm8_for(4, n_byte_groups)
+                .then(|| build_smmla_a_vm8::<2>(&[pd, pd], n_byte_groups / 8))
+        });
+        // H101 tried a `prfm` lookahead here, on the grounds that x86's nq=1
+        // path has had one since H59/H62 and aarch64 never did, and that this
+        // cell runs at 137.3 GB/s against 192.5 available. It does not help:
+        // flat at nq=1 MT and ~3% worse at nq=1 ST at every depth tried. The
+        // hardware prefetcher already has this stream; the 29% gap is
+        // something else.
+        for b in 0..range_blocks {
+            let base = b * BLOCK;
+            let end = (base + BLOCK).min(range_vecs);
+            if MASKED && !block_has_allowed(mask, base) {
+                continue;
+            }
+            // SAFETY: NEON is baseline on aarch64; the permute-dot kernel
+            // additionally needs `dotprod`, which is exactly what put the
+            // codes in the vector-major layout `lut.pd` implies. Slices are
+            // range-relative and consistent.
+            unsafe {
+                if let Some(pd) = lut.pd.as_ref() {
+                    if let Some(a) = vm8_single.as_deref() {
+                        score_block_vm8_single(
+                            codes, pd, a, b * block_bytes, n_byte_groups,
+                            scales_slice, base, range_vecs, &mut out,
+                        );
+                    } else {
+                        score_block_permute_dot_neon::<1>(
+                            codes, &[pd], b * block_bytes, n_byte_groups,
+                            scales_slice, base, range_vecs, &mut out,
+                        );
+                    }
+                } else if lut.pd2.is_some() {
+                    score_2bit_block_vm8_neon(
+                        codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
+                        lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out[0],
+                    );
+                } else if buffered {
+                    score_sign_block_neon(
+                        codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
+                        lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out[0],
+                    );
+                } else {
+                    score_4bit_block_neon(
+                        codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
+                        lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out[0],
+                    );
+                }
+            }
+            if buffered {
+                // H99 collector: append lanes above the threshold; at
+                // capacity keep the best half and raise the threshold.
+                // SAFETY: NEON is baseline; `out[0]` is BLOCK f32 lanes.
+                let block_max = unsafe {
+                    use std::arch::aarch64::*;
+                    let p = out[0].as_ptr();
+                    let m0 = vmaxq_f32(vld1q_f32(p), vld1q_f32(p.add(4)));
+                    let m1 = vmaxq_f32(vld1q_f32(p.add(8)), vld1q_f32(p.add(12)));
+                    let m2 = vmaxq_f32(vld1q_f32(p.add(16)), vld1q_f32(p.add(20)));
+                    let m3 = vmaxq_f32(vld1q_f32(p.add(24)), vld1q_f32(p.add(28)));
+                    vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)))
+                };
+                if block_max <= heap_min {
+                    continue;
+                }
+                let allowed = if MASKED { block_mask_word(mask, base) } else { u32::MAX };
+                for (lane, &s) in out[0][..end - base].iter().enumerate() {
+                    if s > heap_min && (allowed >> lane) & 1 != 0 {
+                        heap.push((s, (base + lane) as u64));
+                        if heap.len() == k {
+                            let keep = (k / 2).max(1);
+                            heap.select_nth_unstable_by(keep - 1, |a, b| {
+                                b.0.partial_cmp(&a.0)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| a.1.cmp(&b.1))
+                            });
+                            heap.truncate(keep);
+                            heap_min = heap[keep - 1].0;
+                        }
+                    }
+                }
+                continue;
+            }
+            // Whole-block prune, mirroring `neon_block_topk_update`: skip
+            // the lane loop when the block's max cannot beat the current
+            // heap minimum. The heap is not cold here — with k <= 32 it
+            // fills within this worker's first block — so the prune is
+            // eligible from block 1 onward.
+            //
+            // H116 measured adding this as neutral (x1.009 ST, x0.987 MT)
+            // and the omission was left documented as harmless. That
+            // conclusion does not hold at the block-parallel gate: crossing
+            // `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` switches nq=1 from the
+            // pruned sub-gate path to this one, and the identical query got
+            // measurably slower for 0.1% more data (#493).
+            //
+            // Safe by construction: a block whose maximum is at or below
+            // the heap minimum contains no lane that could enter the heap,
+            // masked or not. Padding lanes hold NEG_INFINITY (the kernels
+            // guarantee it), and reading them could only raise the max,
+            // which makes the prune fire less often — never more.
+            if heap.len() >= k {
+                // Offsets are written out as constants rather than as
+                // `p.add(i * 4)` in a loop. This body is
+                // `cfg(target_arch = "aarch64")`, so on the x86 mutation
+                // runner it is compiled out and *any* mutant inside it
+                // survives vacuously, however well the logic is tested
+                // (#421) — `replace * with + in scan_range_neon` is
+                // exactly what the gate reported. A literal offset is not
+                // an operator a mutant can rewrite. Same reason
+                // `pack::native_transform` puts its `cfg` on the call
+                // rather than on a function body: leave nothing mutable
+                // in code the gate cannot execute.
+                //
+                // Written as one `max` tree over eight loads, which is
+                // what the loop compiled to anyway — the `chunks_exact`
+                // form measured consistently slower at the gate (90.6 vs
+                // 84.9 us at 1024 blocks).
+                //
+                // SAFETY: NEON is baseline on aarch64; `out[0]` is exactly
+                // BLOCK (32) f32 lanes, so all eight 4-wide loads are in
+                // bounds.
+                let block_max = unsafe {
+                    use std::arch::aarch64::*;
+                    let p = out[0].as_ptr();
+                    let m0 = vmaxq_f32(vld1q_f32(p), vld1q_f32(p.add(4)));
+                    let m1 = vmaxq_f32(vld1q_f32(p.add(8)), vld1q_f32(p.add(12)));
+                    let m2 = vmaxq_f32(vld1q_f32(p.add(16)), vld1q_f32(p.add(20)));
+                    let m3 = vmaxq_f32(vld1q_f32(p.add(24)), vld1q_f32(p.add(28)));
+                    vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)))
+                };
+                if block_max <= heap_min {
+                    continue;
+                }
+            }
+            for (lane, &s) in out[0][..end - base].iter().enumerate() {
+                if MASKED && !mask_allows(mask.expect("MASKED implies a mask"), base + lane) {
+                    continue;
+                }
+                if heap.len() < k {
+                    heap.push((s, (base + lane) as u64));
+                    if heap.len() == k {
+                        heap_mi = 0;
+                        for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
+                            if hs < heap[heap_mi].0
+                                || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
+                            {
+                                heap_mi = h;
+                            }
+                        }
+                        heap_min = heap[heap_mi].0;
+                    }
+                } else if s > heap_min {
+                    heap[heap_mi] = (s, (base + lane) as u64);
+                    heap_mi = 0;
+                    for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
+                        if hs < heap[heap_mi].0 || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
+                        {
+                            heap_mi = h;
+                        }
+                    }
+                    heap_min = heap[heap_mi].0;
+                }
+            }
+        }
+        heap
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    fn search_single_query_block_parallel_neon(
+        blocked_codes: &[u8],
+        lut: &QueryNeonLut,
+        n_byte_groups: usize,
+        vec_scales: &[f32],
+        n_vectors: usize,
+        n_blocks: usize,
+        k: usize,
+        mask: Option<&[u64]>,
+        buffered: bool,
+        block_bytes: usize,
+        heap_min0: f32,
+        hooks: SingleHooks<'_>,
+    ) -> (Vec<f32>, Vec<i64>) {
+        let n_threads = single_query_workers(mask, n_blocks);
+        // One range per thread, and H103 measured that this is right rather
+        // than merely inherited. Giving rayon 4 or 8 ranges per thread to
+        // steal from makes nq=1 MT monotonically *worse* (x0.95, x0.88): each
+        // range costs a heap allocation and a `collect`, and shortens the
+        // sequential stream the prefetcher is riding. The cell's 9% scaling
+        // loss is not steal-starvation.
+        // H106: a buffered (sign-plane) scan on a pool is cut finer than one
+        // range per thread; items are claimed, so a late helper takes fewer.
+        let pieces = if buffered && n_threads > 1 { PLANES_PIECES_PER_WORKER } else { 1 };
+        let blocks_per_range = block_range_stride(n_blocks, n_threads * pieces);
+        let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
+        let seed_cell = std::sync::atomic::AtomicU32::new(heap_min0.to_bits());
+        let seed_pre = || {
+            if let Some(f) = hooks.seed_late {
+                seed_cell.store(f().to_bits(), std::sync::atomic::Ordering::Release);
+            }
+        };
+        let mut candidates: Vec<(f32, u64)> = pool_map_spin(
+            ranges.len(),
+            hooks.seed_late.is_some().then_some(&seed_pre as &(dyn Fn() + Sync)),
+            hooks.owner_first,
+            &|ri: usize| {
+                let block_start = ranges[ri];
+                let heap_min0 =
+                    f32::from_bits(seed_cell.load(std::sync::atomic::Ordering::Acquire));
+                let range_blocks = blocks_per_range.min(n_blocks - block_start);
+                let vec_start = block_start * BLOCK;
+                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
+                let codes = &blocked_codes
+                    [block_start * block_bytes..(block_start + range_blocks) * block_bytes];
+                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
+                let mask_slice = mask.map(|m| &m[vec_start / 64..]);
+                // Monomorphized on mask presence: the unmasked path must
+                // compile to the same lane loop it did before the mask
+                // was threaded through, with no per-lane branch and
+                // nothing inhibiting the loop's unrolling. Sharing one
+                // loop with a loop-invariant `Option` check measured ~18%
+                // slower unmasked at one thread.
+                let heap = if mask_slice.is_some() {
+                    scan_range_neon::<true>(
+                        codes, lut, n_byte_groups, scales_slice, block_bytes,
+                        range_blocks, range_vecs, k, mask_slice, buffered, heap_min0,
+                    )
+                } else {
+                    scan_range_neon::<false>(
+                        codes, lut, n_byte_groups, scales_slice, block_bytes,
+                        range_blocks, range_vecs, k, None, buffered, heap_min0,
+                    )
+                };
+                let mut v = heap
+                    .into_iter()
+                    .map(|(s, i)| (s, i + vec_start as u64))
+                    .collect::<Vec<_>>();
+                if let Some(f) = hooks.post_range {
+                    f(&mut v);
+                }
+                v
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+        if buffered {
+            buffered_select(&mut candidates, k);
+        }
+        // H113: a collector scan's list is rescored, so its order is read
+        // only when the workers already refined it (`post_range`).
+        // H15 (4-bit round 2): a refined list only has to carry its best
+        // `k / 2` to the front; the caller keeps fewer still (P5: the sort
+        // was ~70 us of a 270 us k=100 query on arm).
+        if !buffered {
+            candidates.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+        } else if hooks.post_range.is_some() {
+            buffered_select(&mut candidates, k);
+        }
+        candidates.truncate(k);
+        (
+            candidates.iter().map(|p| p.0).collect(),
+            candidates.iter().map(|p| p.1 as i64).collect(),
+        )
+    }
+
     #[cfg(target_arch = "aarch64")]
     let results = {
-        // ARM: 4-query fused scoring (shares code loads + nibble splits across queries)
-        const QBS: usize = 4;
-        let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
-            .step_by(QBS)
-            .collect::<Vec<_>>()
+        if nq == 1 && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
+            vec![search_single_query_block_parallel_neon(
+                blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
+                n_vectors, n_blocks, k, mask, buffered, block_bytes, seed_of(0), hooks,
+            )]
+        } else {
+        // ARM: 4-query fused scoring (shares code loads + nibble splits
+        // across queries), parallelized over 2D (query-quad × block-range)
+        // tiles. 1D quad partitioning gives ~nq/4 ragged tasks; with ~8-10
+        // workers the tail round idles much of the pool. Splitting the
+        // block axis smooths the schedule. Each tile's per-query top-k
+        // candidates merge with the same (score desc, index asc) order the
+        // single-query block-parallel path uses, so results are identical
+        // to a serial scan. A 1-thread pool gets exactly one range —
+        // identical work and visit order to the serial scan.
+        // Batch width. Permute-dot shares the whole per-register unpack
+        // (load, mask, shift, two TBL) across the batch and adds only two
+        // SDOT per query, so a wider batch raises the fraction of the SIMD
+        // stream doing useful MACs. H29 tried 8 and lost to register
+        // spills; quarter-block accumulators (2 per query) and indexed
+        // weights (1 register per query per two quads) bring the working
+        // set to 24 of 32, which is what makes 8 fit. See LOG_search.md H32.
+        let pd_batched = query_luts.first().is_some_and(|l| l.pd.is_some() || l.pd2.is_some());
+        let pd2_batched = query_luts.first().is_some_and(|l| l.pd2.is_some());
+        // H84: batch width re-test. H40 refuted 12 and 16 on the 4-group
+        // SMMLA kernel, where NQ=12 needed 24 accumulators. vm8's
+        // eighth-blocks (H41) need NP*2 = 12, and 100/12 = 9 sweeps over
+        // the code array against 12.5 — 28% less traffic, against the 14.2%
+        // of cycles P39 still attributes to memory stalls.
+        // Batch width, stepped down to a width the dispatch actually has
+        // an arm for. `tiles` chunks queries by `qbs`, and any chunk whose
+        // size has no `pd_scan!` arm falls to the per-query tail — so a
+        // fixed 12 sends nq=10 through as one unbatched chunk of ten.
+        // Measured: nq=10 cost 39.83 ms that way against 18.06 ms when the
+        // width was 8 (chunks of 8 + 2). Stepping down keeps every nq on a
+        // batched path for all but its remainder. See H90.
+        let qbs: usize = if !pd_batched {
+            4
+        } else if nq >= 12 {
+            12
+        } else if nq >= 8 {
+            8
+        } else {
+            4
+        };
+        /// Widest batch any path here takes; sizes the per-batch scratch.
+        const QBS_MAX: usize = 12;
+        /// The LUT kernel's fixed width.
+        const QBS_LUT: usize = 4;
+        // `.max(1)`: an empty query batch (nq == 0) is a legal no-op —
+        // main returns empty results for it — but it would otherwise be
+        // the divisor below and panic with a divide-by-zero. The tile
+        // loop is empty at nq == 0 either way, so the merge yields the
+        // same empty result.
+        let n_quads = nq.div_ceil(qbs).max(1);
+        let n_threads = rayon::current_num_threads().max(1);
+        let n_ranges = n_block_ranges(
+            nq, n_quads, n_blocks, n_vectors, k_cap, n_threads,
+            TILES_PER_THREAD_NEON,
+            // H14: at 2 bits a block is half its 4-bit bytes, so H69's floor
+            // of 512 makes ranges too small for the trade it was balancing —
+            // the swept optimum is 1024 (18.08 -> 17.70 ms at nq=100 MT, with
+            // 256 and 2048 both worse). 4-bit keeps its own measured 512.
+            if bits == 2 { MIN_TILE_BLOCKS_NEON * 2 } else { MIN_TILE_BLOCKS_NEON },
+            false,
+        );
+        let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
+        let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
+        // Block-range-major, not query-quad-major. Same tile set either
+        // way — only the order rayon draws them in — but quad-major puts
+        // the tiles in flight at any moment in *different* block ranges,
+        // so the workers stream disjoint slices of the code array at
+        // once. Block-major keeps them inside one range, sharing those
+        // bytes in cache. Worth x1.019 arm / x1.004 x86 at nq=100
+        // (see benchmarks/hillclimb/LOG_search.md, H7/H9).
+        let tiles: Vec<(usize, usize)> = (0..n_blocks.max(1))
+            .step_by(blocks_per_range)
+            .flat_map(|b| (0..nq).step_by(qbs).map(move |q| (q, b)))
+            .collect();
+
+        let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
-            .map(|qi_start| {
-                let qi_end = (qi_start + QBS).min(nq);
+            .map(|(qi_start, block_start)| {
+                let block_end = (block_start + blocks_per_range).min(n_blocks);
+                let qi_end = (qi_start + qbs).min(nq);
                 let batch_size = qi_end - qi_start;
 
-                // Materialize per-query scores rows so the 4-query kernel can
-                // write directly with offset = base_vec.
-                let mut scores_flat = vec![f32::NEG_INFINITY; QBS * n_vectors];
-                let rows: [*mut f32; QBS] = unsafe {
-                    let p = scores_flat.as_mut_ptr();
-                    [p, p.add(n_vectors), p.add(2 * n_vectors), p.add(3 * n_vectors)]
-                };
+                // Fused scoring + top-k: no per-quad score matrix. Each block's
+                // 32 scores live on the stack and fold straight into the
+                // per-query heaps (block-ascending, lane-ascending — the same
+                // visit order as the old flat scan, so results are identical).
+                let mut heap_s = vec![vec![f32::NEG_INFINITY; k]; batch_size];
+                let mut heap_i = vec![vec![0u64; k]; batch_size];
+                let mut heap_sz = [0usize; QBS_MAX];
+                let mut heap_min: [f32; QBS_MAX] = std::array::from_fn(|i| {
+                    if qi_start + i < qi_end { seed_of(qi_start + i) } else { f32::NEG_INFINITY }
+                });
+                let mut heap_mi = [if buffered { HEAP_BUFFERED } else { 0usize }; QBS_MAX];
 
-                if batch_size == QBS {
-                    // Fast path: 4-query fused kernel
-                    let lut_refs: [&[u8]; QBS] = [
+                // One fused scan over this tile's blocks for a whole batch
+                // of queries. `$n` is a literal so the kernel's accumulator
+                // count stays a compile-time constant.
+                macro_rules! pd_scan {
+                    ($n:literal, $np:literal) => {{
+                        let pds: [&QueryPermuteDot; $n] = std::array::from_fn(|i| {
+                            let l = &query_luts[qi_start + i];
+                            l.pd.as_ref().or(l.pd2.as_ref()).expect("pd built for every query")
+                        });
+                        // One reshape of the batch's weights, reused by
+                        // every block below. Which reshape depends on the
+                        // layout in memory, which pack.rs decided at load
+                        // or encode time — the two must not disagree.
+                        let vm8 = crate::pack::vm8_for(bits, n_byte_groups);
+                        let a_buf = if pd2_batched {
+                            build_smmla_a_vm8_2bit::<$n>(&pds, n_byte_groups / 8)
+                        } else if vm8 {
+                            build_smmla_a_vm8::<$n>(&pds, n_byte_groups / 8)
+                        } else if have_i8mm() {
+                            build_smmla_a::<$n>(&pds, n_byte_groups / 4)
+                        } else {
+                            Vec::new()
+                        };
+                        let mut block_out = [[0.0f32; BLOCK]; $n];
+                        for block_idx in block_start..block_end {
+                            let base_vec = block_idx * BLOCK;
+                            if !block_has_allowed(mask, base_vec) {
+                                continue;
+                            }
+                            let block_offset = block_idx * block_bytes;
+                            let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
+                            unsafe {
+                                if pd2_batched {
+                                    score_block_smmla_vm8_2bit::<$n, $np>(
+                                        blocked_codes, &pds, &a_buf, block_offset,
+                                        n_byte_groups, vec_scales, base_vec, n_vectors,
+                                        &mut block_out,
+                                    );
+                                } else if vm8 {
+                                    score_block_smmla_vm8::<$n, $np>(
+                                        blocked_codes, &pds, &a_buf, block_offset,
+                                        n_byte_groups, vec_scales, base_vec, n_vectors,
+                                        &mut block_out,
+                                    );
+                                } else if a_buf.is_empty() {
+                                    score_block_permute_dot_neon::<$n>(
+                                        blocked_codes, &pds, block_offset, n_byte_groups,
+                                        vec_scales, base_vec, n_vectors, &mut block_out,
+                                    );
+                                } else {
+                                    score_block_permute_smmla_neon::<$n, $np>(
+                                        blocked_codes, &pds, &a_buf, block_offset,
+                                        n_byte_groups, vec_scales, base_vec, n_vectors,
+                                        &mut block_out,
+                                    );
+                                }
+                                for q in 0..$n {
+                                    neon_block_topk_update(
+                                        &block_out[q], base_vec, end_lane, mask, k,
+                                        &mut heap_s[q], &mut heap_i[q], &mut heap_sz[q],
+                                        &mut heap_min[q], &mut heap_mi[q],
+                                    );
+                                }
+                            }
+                        }
+                    }};
+                }
+
+                if pd_batched && batch_size == 12 {
+                    pd_scan!(12, 6)
+                } else if pd_batched && batch_size == 8 {
+                    pd_scan!(8, 4)
+                } else if pd_batched && batch_size == 4 {
+                    // A tail landing on the narrower width still gets a
+                    // fused scan rather than one query at a time.
+                    pd_scan!(4, 2)
+                } else if !pd_batched && batch_size == QBS_LUT {
+                    // Fast path: 4-query fused LUT kernel
+                    let lut_refs: [&[u8]; QBS_LUT] = [
                         &query_luts[qi_start].uint8_luts,
                         &query_luts[qi_start + 1].uint8_luts,
                         &query_luts[qi_start + 2].uint8_luts,
                         &query_luts[qi_start + 3].uint8_luts,
                     ];
-                    let scales: [f32; QBS] = [
+                    let scales: [f32; QBS_LUT] = [
                         query_luts[qi_start].scale,
                         query_luts[qi_start + 1].scale,
                         query_luts[qi_start + 2].scale,
                         query_luts[qi_start + 3].scale,
                     ];
-                    let biases: [f32; QBS] = [
+                    let biases: [f32; QBS_LUT] = [
                         query_luts[qi_start].bias,
                         query_luts[qi_start + 1].bias,
                         query_luts[qi_start + 2].bias,
                         query_luts[qi_start + 3].bias,
                     ];
-                    for block_idx in 0..n_blocks {
+                    let mut block_out = [[0.0f32; BLOCK]; QBS_LUT];
+                    for block_idx in block_start..block_end {
                         let base_vec = block_idx * BLOCK;
                         if !block_has_allowed(mask, base_vec) {
-                            // Mask leaves `scores_flat` at NEG_INFINITY for these
-                            // slots, so the per-query top-k scan below ignores them
-                            // and the skip is correctness-preserving for all 4
-                            // queries in the batch.
+                            // No allowed slot in the block: skipping it inserts
+                            // nothing, exactly like the old flat scan which left
+                            // NEG_INFINITY rows and mask-skipped every lane.
                             continue;
                         }
-                        let block_offset = block_idx * n_byte_groups * BLOCK;
+                        let block_offset = block_idx * block_bytes;
+                        let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                         unsafe {
                             score_4query_block_neon(
                                 blocked_codes, lut_refs, block_offset, n_byte_groups,
-                                scales, biases, vec_scales, base_vec, n_vectors, rows,
+                                scales, biases, vec_scales, base_vec, n_vectors,
+                                &mut block_out,
                             );
+                            for q in 0..QBS_LUT {
+                                // H68: the helper's common case — heap full, whole block, no
+                                // lane above the heap minimum — tested here instead of behind
+                                // an out-of-line call with a stack frame, four times per block.
+                                // The helper is entered only when a lane can enter the heap and
+                                // runs the identical selection, so results are unchanged.
+                                if (heap_sz[q] >= k || heap_mi[q] == HEAP_BUFFERED) && end_lane == BLOCK {
+                                    use std::arch::aarch64::*;
+                                    let p = block_out[q].as_ptr();
+                                    let m0 = vmaxq_f32(vld1q_f32(p), vld1q_f32(p.add(4)));
+                                    let m1 = vmaxq_f32(vld1q_f32(p.add(8)), vld1q_f32(p.add(12)));
+                                    let m2 = vmaxq_f32(vld1q_f32(p.add(16)), vld1q_f32(p.add(20)));
+                                    let m3 = vmaxq_f32(vld1q_f32(p.add(24)), vld1q_f32(p.add(28)));
+                                    if vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3))) <= heap_min[q] {
+                                        continue;
+                                    }
+                                }
+                                neon_block_topk_update(
+                                    &block_out[q], base_vec, end_lane, mask, k,
+                                    &mut heap_s[q], &mut heap_i[q], &mut heap_sz[q],
+                                    &mut heap_min[q], &mut heap_mi[q],
+                                );
+                            }
                         }
                     }
                 } else {
@@ -1423,105 +6275,415 @@ pub fn search(
                     for qi_off in 0..batch_size {
                         let qi = qi_start + qi_off;
                         let qlut = &query_luts[qi];
-                        let row_ptr = rows[qi_off];
-                        for block_idx in 0..n_blocks {
+                        let vm8_single: Option<Vec<i8>> = qlut.pd.as_ref().and_then(|pd| {
+                            crate::pack::vm8_for(bits, n_byte_groups)
+                                .then(|| build_smmla_a_vm8::<2>(&[pd, pd], n_byte_groups / 8))
+                        });
+                        for block_idx in block_start..block_end {
                             let base_vec = block_idx * BLOCK;
                             if !block_has_allowed(mask, base_vec) {
                                 continue;
                             }
-                            let block_offset = block_idx * n_byte_groups * BLOCK;
-                            let end = (base_vec + BLOCK).min(n_vectors);
-                            let mut block_out = [0.0f32; BLOCK];
+                            let block_offset = block_idx * block_bytes;
+                            let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
+                            let mut block_out = [[0.0f32; BLOCK]; 1];
                             unsafe {
-                                score_4bit_block_neon(
-                                    blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
-                                    qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors, &mut block_out,
-                                );
-                                for lane in 0..(end - base_vec) {
-                                    *row_ptr.add(base_vec + lane) = block_out[lane];
+                                if let Some(pd) = qlut.pd.as_ref() {
+                                    if let Some(a) = vm8_single.as_deref() {
+                                        score_block_vm8_single(
+                                            blocked_codes, pd, a, block_offset, n_byte_groups,
+                                            vec_scales, base_vec, n_vectors, &mut block_out,
+                                        );
+                                    } else {
+                                        score_block_permute_dot_neon::<1>(
+                                            blocked_codes, &[pd], block_offset, n_byte_groups,
+                                            vec_scales, base_vec, n_vectors, &mut block_out,
+                                        );
+                                    }
+                                } else if qlut.pd2.is_some() {
+                                    score_2bit_block_vm8_neon(
+                                        blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                        qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors,
+                                        &mut block_out[0],
+                                    );
+                                } else {
+                                    score_4bit_block_neon(
+                                        blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                        qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors,
+                                        &mut block_out[0],
+                                    );
                                 }
+                                neon_block_topk_update(
+                                    &block_out[0], base_vec, end_lane, mask, k,
+                                    &mut heap_s[qi_off], &mut heap_i[qi_off],
+                                    &mut heap_sz[qi_off], &mut heap_min[qi_off],
+                                    &mut heap_mi[qi_off],
+                                );
                             }
                         }
                     }
                 }
 
-                // Per-query top-k scan over the materialized scores row.
-                (0..batch_size)
+                // Hand back each query's raw candidates; the merge below
+                // sorts across ranges.
+                let cands: Vec<Vec<(f32, u64)>> = (0..batch_size)
                     .map(|qi_off| {
-                        let row_start = qi_off * n_vectors;
-                        let row = &scores_flat[row_start..row_start + n_vectors];
-                        let mut heap_s = vec![f32::NEG_INFINITY; k];
-                        let mut heap_i = vec![0u32; k];
-                        let mut heap_sz = 0usize;
-                        let mut heap_min = f32::NEG_INFINITY;
-                        let mut heap_mi = 0usize;
-                        for (i, &s) in row.iter().enumerate() {
-                            if let Some(m) = mask {
-                                if !mask_allows(m, i) { continue; }
-                            }
-                            if heap_sz < k {
-                                heap_s[heap_sz] = s;
-                                heap_i[heap_sz] = i as u32;
-                                heap_sz += 1;
-                                if heap_sz == k {
-                                    heap_min = heap_s[0];
-                                    heap_mi = 0;
-                                    for h in 1..k {
-                                        if heap_s[h] < heap_min {
-                                            heap_min = heap_s[h];
-                                            heap_mi = h;
-                                        }
-                                    }
-                                }
-                            } else if s > heap_min {
-                                heap_s[heap_mi] = s;
-                                heap_i[heap_mi] = i as u32;
-                                heap_min = heap_s[0];
-                                heap_mi = 0;
-                                for h in 1..k {
-                                    if heap_s[h] < heap_min {
-                                        heap_min = heap_s[h];
-                                        heap_mi = h;
-                                    }
-                                }
-                            }
-                        }
-                        let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
-                            .zip(heap_i[..heap_sz].iter())
-                            .map(|(&s, &i)| (s, i)).collect();
-                        pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                        let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
-                        let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
-                        (s, i)
+                        let sz = heap_sz[qi_off];
+                        heap_s[qi_off][..sz]
+                            .iter()
+                            .zip(heap_i[qi_off][..sz].iter())
+                            .map(|(&s, &i)| (s, i))
+                            .collect()
                     })
-                    .collect()
+                    .collect();
+                (qi_start, cands)
             })
             .collect();
-        results.into_iter().flatten().collect::<Vec<_>>()
+
+        // Merge each query's per-range candidates: (score desc, index asc),
+        // truncate to k — the same deterministic order the heaps maintain,
+        // so tiled and serial results are identical even for tied scores.
+        let mut merged: Vec<Vec<(f32, u64)>> = vec![Vec::new(); nq];
+        for (qi_start, cands) in tile_results {
+            for (off, c) in cands.into_iter().enumerate() {
+                merged[qi_start + off].extend(c);
+            }
+        }
+        let merge_one = |mut pairs: Vec<(f32, u64)>| {
+            if buffered {
+                buffered_select(&mut pairs, k);
+            } else {
+                pairs.sort_unstable_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+            }
+            pairs.truncate(k);
+            let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+            let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+            (s, i)
+        };
+        // H107: a collector scan hands each query several hundred
+        // candidates per range; merging them one query at a time on the
+        // calling worker was 0.7-1.9 ms of an 11 ms search (P47).
+        if buffered && rayon::current_num_threads() > 1 {
+            merged.into_par_iter().map(merge_one).collect::<Vec<_>>()
+        } else {
+            merged.into_iter().map(merge_one).collect::<Vec<_>>()
+        }
+        }
     };
+
+    // Single-query fast path (x86): one query scanning a large index is
+    // memory-bandwidth-bound on one core, so partition the block range
+    // across rayon workers — each range runs the existing SIMD kernel on
+    // its sub-slices (kernels index relative to the slices they are
+    // given), producing a local top-k; ranges then merge. A mask rides
+    // along as a word-aligned sub-slice of the bitmap — see
+    // [`block_range_stride`].
+    #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
+    fn search_single_query_block_parallel(
+        blocked_codes: &[u8],
+        lut: &QueryNeonLut,
+        n_byte_groups: usize,
+        vec_scales: &[f32],
+        n_vectors: usize,
+        n_blocks: usize,
+        k: usize,
+        use_avx512: bool,
+        mask: Option<&[u64]>,
+        buffered: bool,
+        block_bytes: usize,
+        heap_min0: f32,
+        hooks: SingleHooks<'_>,
+    ) -> (Vec<f32>, Vec<i64>) {
+        let n_threads = single_query_workers(mask, n_blocks);
+        // Whole blocks per range, at least 64 blocks (2k vectors) each,
+        // an even count so each range is mask-word aligned.
+        // H106: a buffered (sign-plane) scan on a pool is cut finer than one
+        // range per thread; items are claimed, so a late helper takes fewer.
+        let pieces = if buffered && n_threads > 1 { PLANES_PIECES_PER_WORKER } else { 1 };
+        let blocks_per_range = block_range_stride(n_blocks, n_threads * pieces);
+        let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
+        let seed_cell = std::sync::atomic::AtomicU32::new(heap_min0.to_bits());
+        let seed_pre = || {
+            if let Some(f) = hooks.seed_late {
+                seed_cell.store(f().to_bits(), std::sync::atomic::Ordering::Release);
+            }
+        };
+        let mut candidates: Vec<(f32, u64)> = pool_map_spin(
+            ranges.len(),
+            hooks.seed_late.is_some().then_some(&seed_pre as &(dyn Fn() + Sync)),
+            hooks.owner_first,
+            &|ri: usize| {
+                let block_start = ranges[ri];
+                let heap_min0 =
+                    f32::from_bits(seed_cell.load(std::sync::atomic::Ordering::Acquire));
+                let range_blocks = blocks_per_range.min(n_blocks - block_start);
+                let vec_start = block_start * BLOCK;
+                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
+                let codes =
+                    &blocked_codes[block_start * block_bytes..(block_start + range_blocks) * block_bytes];
+                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
+                let mask_slice = mask.map(|m| &m[vec_start / 64..]);
+                let lut_refs = [lut.uint8_luts.as_slice(); 4];
+                let scale_vals = [lut.scale; 4];
+                let bias_vals = [lut.bias; 4];
+                let mut heap_scores = vec![vec![f32::NEG_INFINITY; k]];
+                let mut heap_indices = vec![vec![0u64; k]];
+                let mut heap_sizes = vec![0usize];
+                let mut heap_mins = vec![heap_min0];
+                let mut heap_min_idxs = vec![if buffered { HEAP_BUFFERED } else { 0usize }];
+                // SAFETY: feature presence checked by the caller once.
+                unsafe {
+                    if let Some(pd) = lut.pd.as_ref() {
+                        let pd_refs = [pd; 1];
+                        let args = (
+                            codes, &pd_refs,
+                            n_byte_groups, scales_slice, range_vecs,
+                            1, k, mask_slice,
+                        );
+                        if have_gfni() {
+                            search_multi_query_permute_dot_gfni::<1, 8>(
+                                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                                &mut heap_scores, &mut heap_indices,
+                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                            );
+                        } else {
+                            search_multi_query_permute_dot::<1, 8>(
+                                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                                &mut heap_scores, &mut heap_indices,
+                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                            );
+                        }
+                    } else if !lut.split.is_empty() {
+                        let split_refs = [lut.split.as_slice(); 4];
+                        search_multi_query_vnni_dispatch(
+                            codes, &split_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, block_bytes, scales_slice, range_vecs,
+                            1, k, mask_slice,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    } else if use_avx512 {
+                        search_multi_query_avx512bw(
+                            codes, &lut_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
+                            1, k, mask_slice,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    } else {
+                        search_multi_query_avx2(
+                            codes, &lut_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
+                            1, k, mask_slice,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    }
+                }
+                let sz = heap_sizes[0];
+                let mut v = heap_scores[0][..sz]
+                    .iter()
+                    .zip(heap_indices[0][..sz].iter())
+                    .map(|(&s, &i)| (s, i + vec_start as u64))
+                    .collect::<Vec<_>>();
+                if let Some(f) = hooks.post_range {
+                    f(&mut v);
+                }
+                v
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+        // Deterministic merge: score desc, index asc on ties.
+        if buffered {
+            buffered_select(&mut candidates, k);
+        }
+        // H113: a collector scan's list is rescored, so its order is read
+        // only when the workers already refined it (`post_range`).
+        // H15 (4-bit round 2): a refined list only has to carry its best
+        // `k / 2` to the front; the caller keeps fewer still (P5: the sort
+        // was ~70 us of a 270 us k=100 query on arm).
+        if !buffered {
+            candidates.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+        } else if hooks.post_range.is_some() {
+            buffered_select(&mut candidates, k);
+        }
+        candidates.truncate(k);
+        (
+            candidates.iter().map(|p| p.0).collect(),
+            candidates.iter().map(|p| p.1 as i64).collect(),
+        )
+    }
 
     #[cfg(target_arch = "x86_64")]
     let results = {
-        const NQ_BATCH: usize = 4;
-        let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
-            .step_by(NQ_BATCH)
-            .collect::<Vec<_>>()
+        #[cfg(test)]
+        let force_scalar_single =
+            FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let force_scalar_single = false;
+        // Every AVX2 kernel (and the AVX-512 kernel's 256-bit epilogue)
+        // declares and executes FMA, so the runtime gate must test it
+        // too — declaring an unchecked feature "would be a lie the
+        // compiler is entitled to act on" (see rotation.rs) and SIGILLs
+        // on avx2-without-fma CPU models (#291).
+        let avx2_fma_ok =
+            is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        let use_avx512 = is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512f")
+            && avx2_fma_ok;
+        let simd_ok = use_avx512 || avx2_fma_ok;
+        if nq == 1
+            && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+            && simd_ok
+            && !force_scalar_single
+        {
+            vec![search_single_query_block_parallel(
+                blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
+                n_vectors, n_blocks, k, use_avx512, mask, buffered, block_bytes, seed_of(0),
+                hooks,
+            )]
+        } else {
+        // 4, on both kernels. The VNNI kernel *can* carry 8 queries per pass
+        // — its u32 accumulators leave the registers free where the classic
+        // kernel's u16 pairs did not (H12) — but doing so halves the quad
+        // count and therefore the tile count, and x86 has no way to buy that
+        // granularity back: H6 showed it degrades with more block ranges.
+        //
+        // H23 measured 8 at parity (x0.997) and kept 4. Permute-dot voided
+        // that result rather than confirming it: H23 was run against the
+        // `vpermb` kernel, where each extra query in a batch cost a 128-byte
+        // LUT load per byte-group, so widening the batch bought fewer passes
+        // at the price of proportionally more table traffic. Permute-dot's
+        // per-query cost inside a batch is an 8-byte broadcast, so the
+        // passes are now nearly free to amortize. Re-measured at 8:
+        // x1.433 single-threaded, x1.116 multi-threaded (H28).
+        // Batch width, chosen so the permute-dot kernel's accumulators
+        // stay in registers — see H34 and the note on
+        // `search_multi_query_permute_dot`.
+        // H124: the width is thread-dependent, because the trade it makes is.
+        // A wider batch buys fewer passes over the code array and pays more
+        // live state per tile. Fewer passes is a single-thread win; more live
+        // state is a multi-thread loss, since every worker pays it into a
+        // shared cache. H123 measured both halves at once — `NQ_BATCH = 10`
+        // was x1.055 at nq=100 ST and x0.966 at MT — so one constant cannot be
+        // right for both, which is why H97's sweep found 8 and H121's ARM
+        // sweep found 12 with neither able to move.
+        //
+        // 10 also divides the nq=100 operating point exactly: 10 passes
+        // against 8's 13.
+        // Gated on 10 actually *saving a pass*, not merely on `nq >= 10`
+        // (H135). The wider batch pays for itself only through the pass it
+        // removes: a batch scores all its lanes and reports only the queries
+        // that exist, so where both widths need the same number of passes the
+        // wider one just pads more lanes. H135 measured that directly —
+        // nq=16 (2 passes either way) x0.882, nq=24 (3/3) x0.863, nq=32 (4/4)
+        // x0.827, against nq=50 (7 passes at 8, 5 at 10) x1.147 and nq=100
+        // (13/10) x1.072. The predicate below is exactly the sign of that
+        // ratio.
+        //
+        // Only when the permute-dot kernel is the one taking the batch:
+        // it is the only x86 kernel with 10 query lanes. The VNNI kernel
+        // that scores 2/3-bit vector-major indexes is 8-wide (`acc` is
+        // `[[__m512i; 2]; 8]` and its loops clamp at 8), so a 10-wide
+        // batch there scored lanes 0..8 and silently dropped queries 8
+        // and 9 — heap sizes stayed 0 and they came back as empty
+        // results. `pd` depends only on bits and geometry, so it is
+        // uniform across the batch and the first query decides for all.
+        // The classic BW/AVX2 arms chunk in 4s and the scalar arm loops
+        // per query, so 8 remains safe everywhere else.
+        let wide_batch_kernel = query_luts.first().is_some_and(|q| q.pd.is_some());
+        // H56: the 2-bit VNNI kernel's per-query cost has its minimum at a
+        // batch of 6 (P36: 0.586 ms/query at N=200k ST against 0.692 at 8
+        // and 0.595 at 4; the same knee L2-resident). Eight was inherited
+        // from the accumulator array's size, not measured. The width is a
+        // const generic (H53), so the tail takes its own instantiation.
+        let vnni_batch_kernel =
+            query_luts.first().is_some_and(|q| q.pd.is_none() && !q.split.is_empty());
+        let nq_batch: usize = if wide_batch_kernel
+            && rayon::current_num_threads().max(1) == 1
+            && nq.div_ceil(10) < nq.div_ceil(8)
+        {
+            10
+        } else if vnni_batch_kernel {
+            VNNI_BATCH
+        } else {
+            8
+        };
+        // 2D tiles (query-quad × block-range), mirroring the ARM path:
+        // 1D quad partitioning leaves a ragged tail round on the pool.
+        // Only when unmasked and SIMD — the mask bitmap is absolute-indexed
+        // and the scalar fallback is unsliced, so those keep one range
+        // (identical behavior to before). A 1-thread pool also keeps one
+        // range: identical work and visit order to the serial scan.
+        #[cfg(test)]
+        let force_scalar_any = FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let force_scalar_any = false;
+        // `.max(1)`: an empty query batch (nq == 0) is a legal no-op —
+        // main returns empty results for it — but it would otherwise be
+        // the divisor below and panic with a divide-by-zero. The tile
+        // loop is empty at nq == 0 either way, so the merge yields the
+        // same empty result.
+        let n_quads = nq.div_ceil(nq_batch).max(1);
+        let n_threads = rayon::current_num_threads().max(1);
+        let n_ranges = n_block_ranges(
+            nq,
+            n_quads,
+            n_blocks,
+            n_vectors,
+            k_cap,
+            n_threads,
+            TILES_PER_THREAD,
+            MIN_TILE_BLOCKS_X86,
+            serial_required(mask.is_some(), simd_ok, force_scalar_any),
+        );
+        let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
+        let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
+        // Block-range-major, not query-quad-major. Same tile set either
+        // way — only the order rayon draws them in — but quad-major puts
+        // the tiles in flight at any moment in *different* block ranges,
+        // so the workers stream disjoint slices of the code array at
+        // once. Block-major keeps them inside one range, sharing those
+        // bytes in cache. Worth x1.019 arm / x1.004 x86 at nq=100
+        // (see benchmarks/hillclimb/LOG_search.md, H7/H9).
+        let tiles: Vec<(usize, usize)> = (0..n_blocks.max(1))
+            .step_by(blocks_per_range)
+            .flat_map(move |b| (0..nq).step_by(nq_batch).map(move |q| (q, b)))
+            .collect();
+
+        let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
-            .flat_map(|qi_start| {
-                let qi_end = (qi_start + NQ_BATCH).min(nq);
+            .map(|(qi_start, block_start)| {
+                let range_blocks = blocks_per_range.min(n_blocks - block_start);
+                let vec_start = block_start * BLOCK;
+                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
+                let codes = &blocked_codes
+                    [block_start * block_bytes..(block_start + range_blocks) * block_bytes];
+                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
+                let qi_end = (qi_start + nq_batch).min(nq);
                 let batch_nq = qi_end - qi_start;
                 let pad_qi = qi_end - 1;
-                let lut_refs: Vec<&[u8]> = (0..NQ_BATCH)
+                let lut_refs: Vec<&[u8]> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
                         query_luts[qi].uint8_luts.as_slice()
                     }).collect();
-                let scale_vals: Vec<f32> = (0..NQ_BATCH)
+                let scale_vals: Vec<f32> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
                         query_luts[qi].scale
                     }).collect();
-                let bias_vals: Vec<f32> = (0..NQ_BATCH)
+                let bias_vals: Vec<f32> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
                         query_luts[qi].bias
@@ -1529,11 +6691,13 @@ pub fn search(
 
                 let mut heap_scores: Vec<Vec<f32>> = (0..batch_nq)
                     .map(|_| vec![f32::NEG_INFINITY; k]).collect();
-                let mut heap_indices: Vec<Vec<u32>> = (0..batch_nq)
-                    .map(|_| vec![0u32; k]).collect();
+                let mut heap_indices: Vec<Vec<u64>> = (0..batch_nq)
+                    .map(|_| vec![0u64; k]).collect();
                 let mut heap_sizes = vec![0usize; batch_nq];
-                let mut heap_mins = vec![f32::NEG_INFINITY; batch_nq];
-                let mut heap_min_idxs = vec![0usize; batch_nq];
+                let mut heap_mins: Vec<f32> =
+                    (0..batch_nq).map(|i| seed_of(qi_start + i)).collect();
+                let mut heap_min_idxs =
+                    vec![if buffered { HEAP_BUFFERED } else { 0usize }; batch_nq];
 
                 #[cfg(test)]
                 let force_scalar =
@@ -1542,25 +6706,144 @@ pub fn search(
                 let force_scalar = false;
 
                 unsafe {
-                    if !force_scalar
+                    // avx2+fma too: the AVX-512 kernel executes 256-bit
+                    // AVX2/FMA instructions (loads, epilogue helpers),
+                    // and the AVX2 kernel uses _mm256_fmadd_ps — gates
+                    // must match the kernels' declared features (#291).
+                    if !force_scalar && query_luts[pad_qi].pd.is_some() {
+                        // 4-bit vector-major: one shared nibble -> level
+                        // permute for the whole batch, then a straight
+                        // integer dot product per query.
+                        // `$n` is a literal so the kernel's accumulator count
+                        // stays a compile-time constant; the runtime choice is
+                        // only which instantiation to enter.
+                        macro_rules! pd_dispatch {
+                            ($n:literal) => {{
+                                let pd_refs: [&QueryPermuteDot; $n] =
+                                    std::array::from_fn(|i| {
+                                        let qi = if qi_start + i < qi_end {
+                                            qi_start + i
+                                        } else {
+                                            pad_qi
+                                        };
+                                        query_luts[qi]
+                                            .pd
+                                            .as_ref()
+                                            .expect("pd built for every query")
+                                    });
+                                if have_gfni() {
+                                    search_multi_query_permute_dot_gfni::<$n, 1>(
+                                        codes, &pd_refs,
+                                        n_byte_groups, scales_slice, range_vecs,
+                                        batch_nq, k, mask,
+                                        &mut heap_scores, &mut heap_indices,
+                                        &mut heap_sizes, &mut heap_mins,
+                                        &mut heap_min_idxs,
+                                    );
+                                } else {
+                                    search_multi_query_permute_dot::<$n, 1>(
+                                        codes, &pd_refs,
+                                        n_byte_groups, scales_slice, range_vecs,
+                                        batch_nq, k, mask,
+                                        &mut heap_scores, &mut heap_indices,
+                                        &mut heap_sizes, &mut heap_mins,
+                                        &mut heap_min_idxs,
+                                    );
+                                }
+                            }};
+                        }
+                        if nq_batch == 10 {
+                            pd_dispatch!(10)
+                        } else {
+                            pd_dispatch!(8)
+                        }
+                    } else if !force_scalar && !query_luts[pad_qi].split.is_empty() {
+                        // Vector-major layout in memory: only this kernel can
+                        // read it, so the choice is made by the layout, not by
+                        // feature detection alone.
+                        let split_refs: Vec<&[u8]> = (0..nq_batch)
+                            .map(|i| {
+                                let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                                query_luts[qi].split.as_slice()
+                            })
+                            .collect();
+                        search_multi_query_vnni_dispatch(
+                            codes, &split_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, block_bytes, scales_slice, range_vecs,
+                            batch_nq, k, mask,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    } else if !force_scalar
                         && is_x86_feature_detected!("avx512bw")
                         && is_x86_feature_detected!("avx512f")
+                        && is_x86_feature_detected!("avx2")
+                        && is_x86_feature_detected!("fma")
                     {
-                        search_multi_query_avx512bw(
-                            blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, vec_scales, n_vectors,
-                            batch_nq, k, mask,
-                            &mut heap_scores, &mut heap_indices,
-                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
-                        );
-                    } else if !force_scalar && is_x86_feature_detected!("avx2") {
-                        search_multi_query_avx2(
-                            blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, vec_scales, n_vectors,
-                            batch_nq, k, mask,
-                            &mut heap_scores, &mut heap_indices,
-                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
-                        );
+                        // Like the AVX2 arm below: the classic BW kernel
+                        // holds four queries of state, so the 8-wide batch
+                        // is consumed in 4-query chunks (reachable on BW-
+                        // without-VNNI parts, e.g. Cascade Lake).
+                        let mut cs = 0;
+                        while cs < batch_nq {
+                            let ce = (cs + 4).min(batch_nq);
+                            // The kernel's prologue reads 4 lanes of
+                            // luts/scales/biases unconditionally (its
+                            // historical callers padded); pad the chunk
+                            // back to 4 — the epilogue writes only
+                            // `0..nq`, so the padding lanes are inert.
+                            let mut ch_luts = [lut_refs[cs]; 4];
+                            let mut ch_scales = [scale_vals[cs]; 4];
+                            let mut ch_biases = [bias_vals[cs]; 4];
+                            let len = ce - cs;
+                            ch_luts[..len].copy_from_slice(&lut_refs[cs..ce]);
+                            ch_scales[..len].copy_from_slice(&scale_vals[cs..ce]);
+                            ch_biases[..len].copy_from_slice(&bias_vals[cs..ce]);
+                            search_multi_query_avx512bw(
+                                codes, &ch_luts, &ch_scales, &ch_biases,
+                                n_byte_groups, scales_slice, range_vecs,
+                                ce - cs, k, mask,
+                                &mut heap_scores[cs..ce], &mut heap_indices[cs..ce],
+                                &mut heap_sizes[cs..ce], &mut heap_mins[cs..ce],
+                                &mut heap_min_idxs[cs..ce],
+                            );
+                            cs = ce;
+                        }
+                    } else if !force_scalar
+                        && is_x86_feature_detected!("avx2")
+                        && is_x86_feature_detected!("fma")
+                    {
+                        // The AVX2 kernel holds FOUR queries of state
+                        // (`fa: [[__m256; 4]; 4]`); NQ_BATCH grew to 8 for
+                        // the wide AVX-512 kernels (H28), so on AVX2-only
+                        // CPUs the batch is consumed in 4-query chunks —
+                        // handing it the full batch indexed out of bounds
+                        // (caught on hardware without AVX-512).
+                        let mut cs = 0;
+                        while cs < batch_nq {
+                            let ce = (cs + 4).min(batch_nq);
+                            // The kernel's prologue reads 4 lanes of
+                            // luts/scales/biases unconditionally (its
+                            // historical callers padded); pad the chunk
+                            // back to 4 — the epilogue writes only
+                            // `0..nq`, so the padding lanes are inert.
+                            let mut ch_luts = [lut_refs[cs]; 4];
+                            let mut ch_scales = [scale_vals[cs]; 4];
+                            let mut ch_biases = [bias_vals[cs]; 4];
+                            let len = ce - cs;
+                            ch_luts[..len].copy_from_slice(&lut_refs[cs..ce]);
+                            ch_scales[..len].copy_from_slice(&scale_vals[cs..ce]);
+                            ch_biases[..len].copy_from_slice(&bias_vals[cs..ce]);
+                            search_multi_query_avx2(
+                                codes, &ch_luts, &ch_scales, &ch_biases,
+                                n_byte_groups, scales_slice, range_vecs,
+                                ce - cs, k, mask,
+                                &mut heap_scores[cs..ce], &mut heap_indices[cs..ce],
+                                &mut heap_sizes[cs..ce], &mut heap_mins[cs..ce],
+                                &mut heap_min_idxs[cs..ce],
+                            );
+                            cs = ce;
+                        }
                     } else {
                         // Neither AVX-512 BW nor AVX2 detected at runtime on
                         // this x86_64 CPU. Previously this fell through to
@@ -1568,6 +6851,8 @@ pub fn search(
                         // at 0 — `search` then returned empty top-k results
                         // for every query with no error signal. Fall back to
                         // per-query scalar scoring instead.
+                        // Only reachable with n_ranges == 1 (see the tiling
+                        // gate), so the unsliced buffers are the full index.
                         for qo in 0..batch_nq {
                             score_query_into_heap(
                                 lut_refs[qo],
@@ -1575,6 +6860,7 @@ pub fn search(
                                 bias_vals[qo],
                                 blocked_codes,
                                 vec_scales,
+                                bits,
                                 n_byte_groups,
                                 n_vectors,
                                 n_blocks,
@@ -1590,22 +6876,54 @@ pub fn search(
                     }
                 }
 
-                let mut batch_results = Vec::with_capacity(batch_nq);
-                for qo in 0..batch_nq {
-                    let sz = heap_sizes[qo];
-                    let mut pairs: Vec<(f32, u32)> = heap_scores[qo][..sz].iter()
-                        .zip(heap_indices[qo][..sz].iter())
-                        .map(|(&s, &i)| (s, i)).collect();
-                    pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                    batch_results.push((
-                        pairs.iter().map(|p| p.0).collect::<Vec<f32>>(),
-                        pairs.iter().map(|p| p.1 as i64).collect::<Vec<i64>>(),
-                    ));
-                }
-                batch_results
+                // Raw candidates with indices remapped to absolute; the
+                // merge below sorts across ranges.
+                let cands: Vec<Vec<(f32, u64)>> = (0..batch_nq)
+                    .map(|qo| {
+                        let sz = heap_sizes[qo];
+                        heap_scores[qo][..sz]
+                            .iter()
+                            .zip(heap_indices[qo][..sz].iter())
+                            .map(|(&s, &i)| (s, i + vec_start as u64))
+                            .collect()
+                    })
+                    .collect();
+                (qi_start, cands)
             })
             .collect();
-        results
+
+        // Merge each query's per-range candidates: (score desc, index asc),
+        // truncate to k — identical selection to the serial heap.
+        let mut merged: Vec<Vec<(f32, u64)>> = vec![Vec::new(); nq];
+        for (qi_start, cands) in tile_results {
+            for (off, c) in cands.into_iter().enumerate() {
+                merged[qi_start + off].extend(c);
+            }
+        }
+        let merge_one = |mut pairs: Vec<(f32, u64)>| {
+            if buffered {
+                buffered_select(&mut pairs, k);
+            } else {
+                pairs.sort_unstable_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+            }
+            pairs.truncate(k);
+            let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+            let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+            (s, i)
+        };
+        // H107: a collector scan hands each query several hundred
+        // candidates per range; merging them one query at a time on the
+        // calling worker was 0.7-1.9 ms of an 11 ms search (P47).
+        if buffered && rayon::current_num_threads() > 1 {
+            merged.into_par_iter().map(merge_one).collect::<Vec<_>>()
+        } else {
+            merged.into_iter().map(merge_one).collect::<Vec<_>>()
+        }
+        }
     };
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -1616,7 +6934,7 @@ pub fn search(
             .map(|qi| {
                 let qlut = &query_luts[qi];
                 let mut heap_s = vec![f32::NEG_INFINITY; k];
-                let mut heap_i = vec![0u32; k];
+                let mut heap_i = vec![0u64; k];
                 let mut heap_sz = 0usize;
                 let mut heap_min = f32::NEG_INFINITY;
                 let mut heap_mi = 0usize;
@@ -1626,6 +6944,7 @@ pub fn search(
                     qlut.bias,
                     blocked_codes,
                     vec_scales,
+                    bits,
                     n_byte_groups,
                     n_vectors,
                     n_blocks,
@@ -1637,25 +6956,466 @@ pub fn search(
                     &mut heap_min,
                     &mut heap_mi,
                 );
-                let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
+                let mut pairs: Vec<(f32, u64)> = heap_s[..heap_sz].iter()
                     .zip(heap_i[..heap_sz].iter()).map(|(&s, &i)| (s, i)).collect();
-                pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
                 (pairs.iter().map(|p| p.0).collect(), pairs.iter().map(|p| p.1 as i64).collect())
             })
             .collect();
         results
     };
 
-    // Flatten into (scores, indices)
+    // Flatten into (scores, indices). A buffered scan's `k` is its
+    // collectors' capacity, twice the shortlist they guarantee, and the
+    // caller reads the shortlist: flattening the spare half as well is
+    // tens of megabytes written and read back, one query at a time, for a
+    // batch at a large shortlist.
+    let k = if buffered { k.div_ceil(2) } else { k };
     let mut all_scores = Vec::with_capacity(nq * k);
     let mut all_indices = Vec::with_capacity(nq * k);
     for (s, i) in &results {
-        let pad = k.saturating_sub(s.len());
-        all_scores.extend_from_slice(s);
+        let n = s.len().min(k);
+        let pad = k - n;
+        all_scores.extend_from_slice(&s[..n]);
         all_scores.extend(std::iter::repeat(f32::NEG_INFINITY).take(pad));
-        all_indices.extend_from_slice(i);
+        all_indices.extend_from_slice(&i[..n]);
         all_indices.extend(std::iter::repeat(0i64).take(pad));
     }
 
     (all_scores, all_indices)
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// The staged search's stage widths, pinned at the k values the
+    /// benchmark cells and #562's recall runs use. Each was chosen against
+    /// a measured recall (see each function); a formula that drifts
+    /// changes what reaches the exact rescore without changing any score a
+    /// test can see, so the values themselves are the contract.
+    #[test]
+    fn staged_search_widths_are_the_measured_ones() {
+        // (k, 4-bit shortlist, 4-bit kept by the first ranking, 4-bit
+        // rescore, 2-bit shortlist, 2-bit rescore)
+        let want = [
+            (1usize, 256usize, 256usize, 64usize, 384usize, 64usize),
+            (10, 256, 256, 64, 384, 64),
+            (32, 640, 256, 64, 512, 64),
+            (43, 860, 258, 64, 688, 86),
+            (64, 1024, 384, 96, 1024, 128),
+            (100, 1600, 600, 150, 1600, 200),
+        ];
+        for (k, s4, m4, r4, s2, r2) in want {
+            assert_eq!(planes_shortlist_len(k, 4), s4, "4-bit shortlist at k={k}");
+            assert_eq!(planes_mid_len(k), m4, "4-bit first-ranking keep at k={k}");
+            assert_eq!(planes_rescore_len(k, 4), r4, "4-bit rescore at k={k}");
+            assert_eq!(planes_shortlist_len(k, 2), s2, "2-bit shortlist at k={k}");
+            assert_eq!(planes_rescore_len(k, 2), r2, "2-bit rescore at k={k}");
+        }
+    }
+
+    /// The single-query pool gate must never fire below the granularity
+    /// at which the batch dispatch itself splits the block axis.
+    ///
+    /// This is the rule the threshold is chosen by (#336): routing an
+    /// nq=1 search into the process-wide fork-safe pool costs an
+    /// `install` handoff *and* a slot in a queue shared by every other
+    /// caller, so it must only happen where the block axis carries at
+    /// least one full tile. At the old value (256 blocks = 8192 vectors)
+    /// the gate fired four tile-widths early: the handoff was larger
+    /// than the entire scan, and every concurrent caller of an 8k-32k
+    /// index was serialized behind the pool for nothing.
+    ///
+    /// A structural invariant rather than a latency assertion on
+    /// purpose: the honest and defective distributions of a ~20 µs
+    /// handoff overlap completely on a loaded CI box.
+    #[test]
+    fn single_query_gate_is_at_least_one_tile_wide() {
+        assert!(
+            SINGLE_QUERY_PARALLEL_MIN_BLOCKS >= MIN_TILE_BLOCKS,
+            "single-query pool gate ({SINGLE_QUERY_PARALLEL_MIN_BLOCKS} blocks) fires below \
+             the batch dispatch's own tile granularity ({MIN_TILE_BLOCKS} blocks): an nq=1 \
+             search would enter the shared pool at a size where the work is not worth \
+             splitting (#336)",
+        );
+    }
+
+    /// `single_query_parallelizes` is the predicate the Python bindings
+    /// use to decide whether a search must run inside the fork-safe
+    /// pool, so a single query it reports as *serial* must not reach
+    /// rayon in the batch dispatch either — whatever the tile
+    /// granularity (#147). The clamp is what makes the threshold safe to
+    /// move; without it, raising the gate past `MIN_TILE_BLOCKS` would
+    /// split the block axis outside the pool.
+    #[test]
+    fn sub_gate_single_query_never_splits_the_block_axis() {
+        let n_vectors = (SINGLE_QUERY_PARALLEL_MIN_BLOCKS - 1) * BLOCK;
+        let n_blocks = n_vectors.div_ceil(BLOCK);
+        assert!(!single_query_parallelizes(n_vectors));
+        for &min_tile in &[1usize, 8, 64, MIN_TILE_BLOCKS] {
+            assert_eq!(
+                n_block_ranges(1, 1, n_blocks, n_vectors, 10, 16, TILES_PER_THREAD, min_tile, false),
+                1,
+                "nq=1 below the pool gate split the block axis at min_tile={min_tile}",
+            );
+        }
+        // The clamp is specific to nq == 1: a real batch at the same
+        // size still tiles.
+        assert!(n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, TILES_PER_THREAD, 1, false) > 1);
+    }
+
+    /// Above the gate a single query does split, so routing it through
+    /// the pool is the correct call — the two halves of the rule have to
+    /// agree or the gate is either useless or unsafe.
+    #[test]
+    fn above_gate_single_query_does_split() {
+        let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 4;
+        assert!(single_query_parallelizes(n_vectors));
+        assert!(
+            n_block_ranges(
+                1,
+                1,
+                n_vectors.div_ceil(BLOCK),
+                n_vectors,
+                10,
+                16,
+                TILES_PER_THREAD,
+                MIN_TILE_BLOCKS,
+                false
+            ) > 1
+        );
+    }
+
+    /// Packs a bool mask the way `try_search_with_mask` does.
+    fn pack_mask(m: &[bool]) -> Vec<u64> {
+        m.chunks(64)
+            .map(|c| c.iter().enumerate().fold(0u64, |w, (bit, &b)| w | ((b as u64) << bit)))
+            .collect()
+    }
+
+    /// #554: the single-query split counts the blocks a mask leaves
+    /// allowed, not the index's. A mask that allows the gate's worth of
+    /// blocks keeps the pool; one allowing fewer — however large the
+    /// index, and wherever its blocks sit — runs on the calling thread.
+    #[test]
+    fn a_selective_mask_scans_in_one_range() {
+        let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 4;
+        let n_blocks = n_vectors.div_ceil(BLOCK);
+        let threads = rayon::current_num_threads().max(1);
+        // Unmasked, the index is past the gate.
+        assert_eq!(single_query_workers(None, n_blocks), threads);
+        // One id, one block.
+        let mut one = vec![false; n_vectors];
+        one[0] = true;
+        assert_eq!(allowed_blocks(Some(&pack_mask(&one)), n_blocks), 1);
+        assert_eq!(single_query_workers(Some(&pack_mask(&one)), n_blocks), 1);
+        // A contiguous tenth: a quarter of the gate's blocks.
+        let mut tenth = vec![false; n_vectors];
+        tenth[..n_vectors / 10].fill(true);
+        assert_eq!(allowed_blocks(Some(&pack_mask(&tenth)), n_blocks), (n_vectors / 10).div_ceil(BLOCK));
+        assert_eq!(single_query_workers(Some(&pack_mask(&tenth)), n_blocks), 1);
+        // One vector in every block: as many allowed blocks as an
+        // unmasked index, and the odd blocks test the high half-word.
+        let mut sparse = vec![false; n_vectors];
+        for b in 0..n_blocks {
+            sparse[b * BLOCK + 7] = true;
+        }
+        assert_eq!(allowed_blocks(Some(&pack_mask(&sparse)), n_blocks), n_blocks);
+        assert_eq!(single_query_workers(Some(&pack_mask(&sparse)), n_blocks), threads);
+        // Exactly the gate's worth of blocks is parallel; one fewer is not.
+        let mut at_gate = vec![false; n_vectors];
+        for b in 0..SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
+            at_gate[b * BLOCK] = true;
+        }
+        assert_eq!(single_query_workers(Some(&pack_mask(&at_gate)), n_blocks), threads);
+        at_gate[0] = false;
+        assert_eq!(single_query_workers(Some(&pack_mask(&at_gate)), n_blocks), 1);
+    }
+
+    /// The bindings decide whether a masked nq=1 search enters the pool
+    /// from the bool mask, before the core packs it; the core splits from
+    /// the packed form. The two counts are the same count, or the #147
+    /// invariant breaks in one direction or the other.
+    #[test]
+    fn the_masked_pool_predicate_agrees_with_the_core() {
+        let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 2 + 5;
+        let n_blocks = n_vectors.div_ceil(BLOCK);
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for density_bits in 0..12u32 {
+            // Densities from one vector in 2048 to every other one, so the
+            // allowed-block count crosses the gate inside the sweep.
+            let mut m = vec![false; n_vectors];
+            for b in m.iter_mut() {
+                *b = next() % (1u64 << density_bits) == 0;
+            }
+            let packed = pack_mask(&m);
+            let core = allowed_blocks(Some(&packed), n_blocks) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS;
+            assert_eq!(
+                single_query_parallelizes_masked(n_vectors, Some(&m)),
+                core,
+                "density 2^-{density_bits}: the bindings' predicate and the core's split disagree",
+            );
+            assert_eq!(
+                single_query_workers(Some(&packed), n_blocks) > 1,
+                core && rayon::current_num_threads() > 1,
+            );
+        }
+        assert_eq!(single_query_parallelizes_masked(n_vectors, None), single_query_parallelizes(n_vectors));
+    }
+
+    /// Pin the tile target where it is the binding term: enough blocks
+    /// that the block cap clears, k small enough that the k-cap clears,
+    /// n_quads equal to n_threads so the target divides out exactly.
+    /// `(16 * TILES_PER_THREAD).div_ceil(16) = TILES_PER_THREAD` — this
+    /// is the assertion the baseline test above cannot make (its block
+    /// cap binds first), and the one that distinguishes 32 from the old
+    /// 4 (or any arithmetic slip in the target term).
+    #[test]
+    fn the_tile_target_binds_when_the_caps_do_not() {
+        let n_blocks = 100 * MIN_TILE_BLOCKS; // block cap = 100 >> target
+        let n_vectors = n_blocks * BLOCK;
+        assert_eq!(
+            n_block_ranges(64, 16, n_blocks, n_vectors, 1, 16, TILES_PER_THREAD, MIN_TILE_BLOCKS, false),
+            TILES_PER_THREAD,
+            "with both caps clear, the range count IS the per-worker tile target",
+        );
+        // And the NEON pair keeps its documented relation to the shared
+        // constants: 2x finer target (H15), 2x finer block floor (H69 —
+        // was 4x until the kernel got fast enough that fewer, longer
+        // contiguous runs beat a finer split).
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(TILES_PER_THREAD_NEON, TILES_PER_THREAD * 2);
+            assert_eq!(MIN_TILE_BLOCKS_NEON, MIN_TILE_BLOCKS / 2);
+        }
+    }
+
+    /// Each of the three conditions that forces `n_block_ranges` to 1
+    /// must do so ON ITS OWN. The tests above only ever vary the third
+    /// disjunct (`nq == 1` below the pool gate), which left the `||`
+    /// joining `n_threads == 1` and `serial` unpinned: turned into `&&`
+    /// it reads `(n_threads == 1 && serial) || (nq == 1 && ..)`, so a
+    /// single-threaded pool would start splitting the block axis and a
+    /// masked or scalar search would too. Both are #147 violations.
+    ///
+    /// The size is chosen above the pool gate so that "all three false"
+    /// genuinely splits — otherwise every row would return 1 for the
+    /// wrong reason and the table could not fail.
+    #[test]
+    fn each_serial_condition_forces_one_range_on_its_own() {
+        let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 4;
+        let n_blocks = n_vectors.div_ceil(BLOCK);
+        assert!(
+            single_query_parallelizes(n_vectors),
+            "fixture must sit above the pool gate or the table is vacuous",
+        );
+
+        // Baseline: nothing forces serial, so the axis does split.
+        //
+        // Pinned to the exact count, not just `> 1`. The three rows below
+        // only prove the guard fires; nothing else pins the arithmetic
+        // *under* it, and `> 1` is too loose to notice a change there —
+        // e.g. `(n_threads * 4)` becoming `(n_threads + 4)` yields 2,
+        // which still satisfies `> 1` while halving the parallelism on
+        // every batch search. For this tuple the three terms are
+        // `(16 * 32).div_ceil(16) = 32`, `n_blocks.div_ceil(MIN_TILE_BLOCKS)
+        // = 4096/1024 = 4`, and `range_cap_for_k(131072, 10) = 26`, so
+        // the min is the BLOCK cap, 4 — the tile target does not bind
+        // here; `the_tile_target_binds_when_the_caps_do_not` pins it.
+        // Update this number deliberately if a cap moves.
+        assert_eq!(
+            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, TILES_PER_THREAD, MIN_TILE_BLOCKS, false),
+            4,
+            "baseline range count changed; the rows below prove only that \
+             the guard fires, so this is the one place the arithmetic \
+             beneath it is pinned",
+        );
+
+        // n_threads == 1 alone. `n_quads` is 1 so the guard is the only
+        // thing that can force 1: without it the arithmetic yields
+        // `(1 * TILES_PER_THREAD).div_ceil(1) = 32`, capped to 4 by the
+        // block cap — either way well above 1. (At the old target of 4
+        // a 16-quad row was vacuous, `(1*4).div_ceil(16) == 1` with or
+        // without the guard; at 32 it no longer is, but 1 quad keeps
+        // the row's margin the widest.) This is the disjunct that fires
+        // in production — the bindings pin the global pool to a
+        // 1-thread sentinel, so the inline nq==1 path sees
+        // `rayon::current_num_threads() == 1`.
+        assert_eq!(
+            n_block_ranges(64, 1, n_blocks, n_vectors, 10, 1, TILES_PER_THREAD, MIN_TILE_BLOCKS, false),
+            1,
+            "a single-threaded pool must not split the block axis",
+        );
+
+        // serial alone.
+        assert_eq!(
+            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, TILES_PER_THREAD, MIN_TILE_BLOCKS, true),
+            1,
+            "an explicitly serial call must not split the block axis",
+        );
+
+        // nq == 1 below the gate alone. `min_tile` must be 1 here, not
+        // MIN_TILE_BLOCKS: this fixture is one block short of the gate
+        // (n_blocks = MIN_TILE_BLOCKS - 1), so the below-guard cap
+        // `n_blocks.div_ceil(min_tile_blocks)` would be
+        // `1023.div_ceil(1024) == 1` and force the whole `.min()` chain
+        // to 1 whether or not the guard exists — the same vacuity the
+        // n_threads row above had.
+        let small = (SINGLE_QUERY_PARALLEL_MIN_BLOCKS - 1) * BLOCK;
+        assert_eq!(
+            n_block_ranges(1, 1, small.div_ceil(BLOCK), small, 10, 16, TILES_PER_THREAD, 1, false),
+            1,
+            "nq=1 below the pool gate must not split the block axis (#147)",
+        );
+    }
+
+    /// `serial_required` is the dispatch's three-term serial predicate.
+    /// Each term must force serial on its own: a mask makes the walk
+    /// sequential, absent SIMD leaves nothing to tile, and a forced
+    /// scalar path is a caller instruction. Inline at the call site these
+    /// terms were unreachable from any test, so an `||` could silently
+    /// become `&&` — which would let a masked search split the block
+    /// axis outside the fork-safe pool (#147).
+    ///
+    /// Gated to x86 with the function it tests: the aarch64 dispatch
+    /// passes a literal `false`, so there is no predicate there to pin.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn each_term_of_the_serial_predicate_forces_serial_alone() {
+        // All false is the only combination that may run parallel.
+        assert!(!serial_required(false, true, false));
+
+        assert!(serial_required(true, true, false), "a mask alone must force serial");
+        assert!(serial_required(false, false, false), "absent SIMD alone must force serial");
+        assert!(serial_required(false, true, true), "forced scalar alone must force serial");
+
+        // And any combination stays serial.
+        assert!(serial_required(true, false, true));
+    }
+
+    /// `split_lut_for_vnni` rearranges [hi_16 | lo_16] per group into the
+    /// 128-byte concatenations `vpermb` indexes: all four hi halves of a
+    /// group-quad first, then all four lo halves. Pinned byte-for-byte
+    /// against an asymmetric ramp over two quads, so any slip in the quad
+    /// stride, the half offset, or the per-group base breaks a specific
+    /// byte rather than surviving as a shuffle of equal values.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn split_lut_for_vnni_is_the_documented_byte_map() {
+        let n_byte_groups = 8usize;
+        let src: Vec<u8> = (0..n_byte_groups * 32).map(|i| (i % 253) as u8).collect();
+        let out = split_lut_for_vnni(&src, n_byte_groups);
+        for g in 0..n_byte_groups {
+            let c = (g / 4) * 128;
+            let j = g % 4;
+            let s = g * 32;
+            assert_eq!(
+                &out[c + j * 16..c + j * 16 + 16],
+                &src[s + 16..s + 32],
+                "hi half of group {g}",
+            );
+            assert_eq!(
+                &out[c + 64 + j * 16..c + 64 + j * 16 + 16],
+                &src[s..s + 16],
+                "lo half of group {g}",
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn two_bit_permute_dot_scales_an_ordinary_query_by_its_largest_coordinate() {
+        // The scale guard exists for subnormal queries only: an ordinary
+        // row must land its largest coordinate on +-127, and a row too
+        // small to scale must fall back to unit scale with zero weights.
+        let centroids = [-1.5f32, -0.5, 0.5, 1.5];
+        let row: Vec<f32> = (0..32).map(|d| (d as f32 - 15.5) / 64.0).collect();
+        let pd = build_permute_dot_2bit(&row, &centroids, 32);
+        assert_eq!(pd.weights.iter().map(|w| w.unsigned_abs()).max(), Some(127));
+        assert_eq!(pd.weights[0], -127);
+        assert_eq!(pd.weights[31], 127);
+        let q_max = 15.5f32 / 64.0;
+        assert_eq!(pd.scale, (1.5 / 127.0) * (q_max / 127.0));
+        let tiny = vec![f32::MIN_POSITIVE / 4.0; 32];
+        let pd = build_permute_dot_2bit(&tiny, &centroids, 32);
+        assert!(pd.weights.iter().all(|&w| w == 0));
+        assert_eq!(pd.scale, 1.5 / 127.0);
+    }
+
+    /// Pin `build_permute_dot`'s weight placement and its accumulator seed.
+    /// The seed must be exactly `-128 * Σ w` — that is the whole basis of
+    /// the +128 bias cancellation — and each dimension's int8 weight must
+    /// land at the documented slot: low nibble (odd dim) at `q4*8+j`, high
+    /// (even dim) at `q4*8+4+j`.
+    #[test]
+    fn permute_dot_weights_land_at_their_slots_and_seed_the_bias() {
+        let dim = 16usize; // 8 byte-groups, 2 quads
+        let n_byte_groups = dim / 2;
+        // Asymmetric, sign-mixed row so every slot is distinct and the
+        // quantizer's scale is exercised away from 1.
+        let q_rot_row: Vec<f32> = (0..dim).map(|d| (d as f32 - 5.5) * 0.11).collect();
+        let centroids: Vec<f32> = (0..16).map(|i| (i as f32 - 7.5) / 8.0).collect();
+        let pd = build_permute_dot(&q_rot_row, &centroids, dim);
+
+        let qmax = q_rot_row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let inv_qs = 1.0 / (qmax / 127.0); // the impl's own expression, ulp-exact
+        for g in 0..n_byte_groups {
+            let (q4, j) = (g / 4, g % 4);
+            let lo = (q_rot_row[2 * g + 1] * inv_qs).round().clamp(-127.0, 127.0) as i8;
+            let hi = (q_rot_row[2 * g] * inv_qs).round().clamp(-127.0, 127.0) as i8;
+            assert_eq!(pd.weights[q4 * 8 + j], lo, "low-nibble weight of group {g}");
+            assert_eq!(pd.weights[q4 * 8 + 4 + j], hi, "high-nibble weight of group {g}");
+        }
+        let wsum: i32 = pd.weights.iter().map(|&w| w as i32).sum();
+        assert_eq!(pd.zero, -128 * wsum, "accumulator seed must cancel the +128 bias");
+    }
+
+    /// The SMMLA A-operand builders are pure shuffles of
+    /// [`QueryPermuteDot::weights`]; pin them against the documented maps.
+    /// aarch64-only because the kernels that read them are.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn smmla_a_operands_match_the_weight_maps() {
+        let dim = 32usize; // 16 byte-groups: 4 quads, 2 octs
+        let q0: Vec<f32> = (0..dim).map(|d| (d as f32 - 9.5) * 0.07).collect();
+        let q1: Vec<f32> = (0..dim).map(|d| (14.5 - d as f32) * 0.05).collect();
+        let centroids: Vec<f32> = (0..16).map(|i| (i as f32 - 7.5) / 8.0).collect();
+        let pd0 = build_permute_dot(&q0, &centroids, dim);
+        let pd1 = build_permute_dot(&q1, &centroids, dim);
+        let pds: [&QueryPermuteDot; 2] = [&pd0, &pd1];
+
+        let quads = dim / 8;
+        let a = build_smmla_a::<2>(&pds, quads);
+        for q4 in 0..quads {
+            for (r, pd) in pds.iter().enumerate() {
+                let dst = q4 * 16; // one pair
+                let w = &pd.weights[q4 * 8..q4 * 8 + 8];
+                for j in 0..4 {
+                    assert_eq!(a[dst + r * 8 + 2 * j], w[4 + j], "even dim, quad {q4} row {r} j {j}");
+                    assert_eq!(a[dst + r * 8 + 2 * j + 1], w[j], "odd dim, quad {q4} row {r} j {j}");
+                }
+            }
+        }
+
+        let octs = dim / 16;
+        let a8 = build_smmla_a_vm8::<2>(&pds, octs);
+        for q8 in 0..octs {
+            for (r, pd) in pds.iter().enumerate() {
+                let dst = q8 * 32; // one pair
+                for j in 0..8 {
+                    let g = 8 * q8 + j;
+                    let (q4, slot) = (g / 4, g % 4);
+                    assert_eq!(a8[dst + r * 8 + j], pd.weights[q4 * 8 + 4 + slot], "even dim, oct {q8} row {r} j {j}");
+                    assert_eq!(a8[dst + 16 + r * 8 + j], pd.weights[q4 * 8 + slot], "odd dim, oct {q8} row {r} j {j}");
+                }
+            }
+        }
+    }
 }
